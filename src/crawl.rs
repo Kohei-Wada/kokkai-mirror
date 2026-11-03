@@ -89,9 +89,10 @@ pub fn crawl_day(
         .map(|(m, _)| m.issue_id.as_str())
         .collect::<BTreeSet<_>>()
         .len();
-    if distinct != total as usize {
+    if distinct != total as usize || meetings.len() != total as usize {
         return Ok(DayOutcome::Inconsistent(format!(
-            "{distinct} distinct meetings of {total} reported for {date}"
+            "{} meetings ({distinct} distinct) of {total} reported for {date}",
+            meetings.len()
         )));
     }
     store
@@ -423,6 +424,22 @@ mod tests {
         let http = fake(vec![
             (1, fixture("meeting_day_p1.json")),
             (3, p2.into_bytes()),
+        ]);
+        let out = crawl_day(&http, &store, day(), &now).unwrap();
+        assert!(matches!(out, DayOutcome::Inconsistent(_)), "{out:?}");
+        assert_eq!(store.days().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn duplicate_meetings_are_not_applied() {
+        let mut p2: serde_json::Value =
+            serde_json::from_slice(&fixture("meeting_day_p2.json")).unwrap();
+        let records = p2["meetingRecord"].as_array_mut().unwrap();
+        records.push(records[0].clone());
+        let (_d, store) = store();
+        let http = fake(vec![
+            (1, fixture("meeting_day_p1.json")),
+            (3, serde_json::to_vec(&p2).unwrap()),
         ]);
         let out = crawl_day(&http, &store, day(), &now).unwrap();
         assert!(matches!(out, DayOutcome::Inconsistent(_)), "{out:?}");
