@@ -30,7 +30,11 @@ It is an experiment and a toy for exploring the Diet's record. The software is w
   `/api/meeting`, with the same query parameters and response shape), so an NDL API client only
   changes its base URL. No rate limit on the mirror itself.
   - For structured parameters (speaker, house, meeting name, session, dates, issue/speech IDs,
-    paging) results match the NDL: same hits, `numberOfRecords`, order. *(my call)*
+    paging) results match the NDL: same hits and `numberOfRecords`. *(my call)* The order is
+    approximate, and every response and the README say so. *(user, 2026-11-03)* `meeting_list` sorts by
+    meeting name first, in an order that follows the names' readings (本会議 and 予算委員会 first,
+    then roughly 五十音), and `speech` sorts same-day meetings by that order too. No response contains
+    those readings, so the mirror cannot reproduce the order from what it fetches.
   - Full-text search (`any`) may be approximate (e.g. SQLite FTS); the response says so. *(my call)*
   - By default the mirror returns the current version of each record, as the NDL would now.
     Older versions and records the NDL has dropped are kept and available through mirror-only
@@ -91,6 +95,8 @@ It is an experiment and a toy for exploring the Diet's record. The software is w
 - Same API shape as the NDL. *(my call, from the user's "kokkai-cli just points at it")*
 - Keep every version; report changes. *(my call)*
 - Name: kokkai-mirror. *(user)*
+- Result sets and `numberOfRecords` match the NDL; the order does not, and responses say so. *(user,
+  2026-11-03)*
 
 ## Left to the builder
 
