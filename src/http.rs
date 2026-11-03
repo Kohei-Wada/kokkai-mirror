@@ -124,7 +124,10 @@ fn parse_retry_after(value: &str, now: Timestamp) -> Option<Duration> {
     }
     static PARSER: jiff::fmt::rfc2822::DateTimeParser = jiff::fmt::rfc2822::DateTimeParser::new();
     let at = PARSER.parse_timestamp(value).ok()?;
-    Some(Duration::try_from(at.duration_since(now)).unwrap_or(Duration::ZERO))
+    // A date already past (clock skew, stale reply) says nothing, so the normal backoff applies.
+    Duration::try_from(at.duration_since(now))
+        .ok()
+        .filter(|d| !d.is_zero())
 }
 
 impl Http for Client {
@@ -306,6 +309,23 @@ mod tests {
             assert_eq!(seen.lock().unwrap().len(), 2, "{value}");
             assert_eq!(*sleeps.lock().unwrap(), [2.0], "{value}");
         }
+    }
+
+    #[test]
+    fn past_retry_after_date_falls_back_to_backoff() {
+        let (c, seen, sleeps) = client(
+            vec![
+                Err(Failure::Status(
+                    503,
+                    Some("Tue, 03 Nov 2026 02:59:00 GMT".into()),
+                )),
+                Ok(b"ok".to_vec()),
+            ],
+            spread(10),
+        );
+        assert_eq!(c.get("https://x").unwrap(), b"ok");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert_eq!(*sleeps.lock().unwrap(), [2.0]);
     }
 
     #[test]
