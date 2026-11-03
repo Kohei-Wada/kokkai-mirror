@@ -74,19 +74,20 @@ CREATE TABLE meetings(
     issue_no INTEGER, version_id INTEGER, dropped_at TEXT, last_verified TEXT);
 CREATE INDEX meetings_date ON meetings(date);
 CREATE TABLE speeches(
-    speech_id TEXT PRIMARY KEY, issue_id TEXT, speech_order INTEGER, speaker TEXT,
-    yomi TEXT, grp TEXT, position TEXT, role TEXT, text TEXT);
+    id INTEGER PRIMARY KEY, speech_id TEXT UNIQUE NOT NULL, issue_id TEXT,
+    speech_order INTEGER, speaker TEXT, yomi TEXT, grp TEXT, position TEXT, role TEXT, text TEXT);
 CREATE INDEX speeches_issue ON speeches(issue_id, speech_order);
-CREATE VIRTUAL TABLE speech_fts USING fts5(text, content='speeches', tokenize='trigram');
+CREATE VIRTUAL TABLE speech_fts USING fts5(
+    text, content='speeches', content_rowid='id', tokenize='trigram');
 CREATE TRIGGER speeches_ai AFTER INSERT ON speeches BEGIN
-    INSERT INTO speech_fts(rowid, text) VALUES (new.rowid, new.text);
+    INSERT INTO speech_fts(rowid, text) VALUES (new.id, new.text);
 END;
 CREATE TRIGGER speeches_ad AFTER DELETE ON speeches BEGIN
-    INSERT INTO speech_fts(speech_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+    INSERT INTO speech_fts(speech_fts, rowid, text) VALUES ('delete', old.id, old.text);
 END;
 CREATE TRIGGER speeches_au AFTER UPDATE ON speeches BEGIN
-    INSERT INTO speech_fts(speech_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
-    INSERT INTO speech_fts(rowid, text) VALUES (new.rowid, new.text);
+    INSERT INTO speech_fts(speech_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO speech_fts(rowid, text) VALUES (new.id, new.text);
 END;
 CREATE TABLE changes(
     id INTEGER PRIMARY KEY, issue_id TEXT, kind TEXT, from_version INTEGER,

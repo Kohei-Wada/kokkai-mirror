@@ -454,7 +454,7 @@ fn speech_where(q: &Query) -> Where {
     for t in &q.any {
         if t.chars().count() >= 3 {
             w.push(
-                "s.rowid IN (SELECT rowid FROM speech_fts WHERE speech_fts MATCH ?)",
+                "s.id IN (SELECT rowid FROM speech_fts WHERE speech_fts MATCH ?)",
                 [Sql::Text(format!("\"{}\"", t.replace('"', "\"\"")))],
             );
         } else {
@@ -871,6 +871,27 @@ mod tests {
         let (_, v) = ask(&store, Endpoint::Speech, &format!("{q}会議を開+散会"));
         assert_eq!(v["numberOfRecords"], 0);
         assert_eq!(v["mirror"]["approximate"], json!(["order", "any"]));
+    }
+
+    #[test]
+    fn any_survives_a_vacuum_and_a_dump_restore() {
+        let (_dir, store) = filled();
+        // A dump restores rows by their columns, with the triggers created after the data.
+        store
+            .conn()
+            .execute_batch(&format!(
+                "DELETE FROM speeches WHERE issue_id IN ('{M1}', '999900002X00220261020');
+                 VACUUM;
+                 DROP TRIGGER speeches_ai; DROP TRIGGER speeches_ad; DROP TRIGGER speeches_au;
+                 CREATE TEMP TABLE saved AS SELECT * FROM speeches;
+                 DELETE FROM speeches;
+                 INSERT INTO speeches SELECT * FROM saved;"
+            ))
+            .unwrap();
+        let (_, v) = ask(&store, Endpoint::Speech, &format!("{RANGE}&any=会議を開"));
+        assert_eq!(speech_ids(&v), ["999900009X00120261021_001"]);
+        let (_, v) = ask(&store, Endpoint::Speech, &format!("{RANGE}&any=了解しま"));
+        assert_eq!(speech_ids(&v), ["999900003X00320261020_002"]);
     }
 
     #[test]
