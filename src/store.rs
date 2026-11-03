@@ -145,7 +145,16 @@ fn parse_date(s: &str) -> anyhow::Result<Date> {
 }
 
 fn issue_no(issue: &str) -> i64 {
-    let digits: String = issue.chars().filter(char::is_ascii_digit).collect();
+    let ascii = |c: char| match c {
+        '０'..='９' => char::from_u32(c as u32 - '０' as u32 + '0' as u32),
+        c => Some(c),
+    };
+    let digits: String = issue
+        .chars()
+        .filter_map(ascii)
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect();
     digits.parse().unwrap_or(0)
 }
 
@@ -915,6 +924,19 @@ mod tests {
             .read_to_end(&mut body)
             .unwrap();
         assert_eq!(body, P1);
+    }
+
+    #[test]
+    fn issue_no_is_the_first_number() {
+        for (issue, no) in [
+            ("第1号", 1),
+            ("第12号", 12),
+            ("第1号(その2)", 1),
+            ("第１２号", 12),
+            ("目次", 0),
+        ] {
+            assert_eq!(issue_no(issue), no, "{issue}");
+        }
     }
 
     #[test]
