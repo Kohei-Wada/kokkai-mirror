@@ -1,10 +1,14 @@
 use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
+use std::path::Path;
+use std::time::Duration;
 
 use jiff::civil::Date;
 use jiff::Timestamp;
 
-use crate::http::{Http, HttpError};
+use crate::http::{Http, HttpError, NDL_SPACING};
 use crate::ndl::{day_url, parse_page, Meeting, NdlError};
+use crate::progress::Progress;
 use crate::store::{DayReport, Store};
 
 #[derive(Debug)]
@@ -94,6 +98,196 @@ pub fn crawl_day(
         .apply_day(date, &meetings, now())
         .map(DayOutcome::Applied)
         .map_err(CrawlError::Store)
+}
+
+const RECENT_DAYS: i32 = 180;
+const DAILY_DAYS: i32 = 30;
+const DAY_SECS: i64 = 86_400;
+const OLD_RECHECK_SECS: i64 = 30 * DAY_SECS;
+const IDLE: Duration = Duration::from_secs(60);
+const BUSY: Duration = Duration::from_secs(300);
+const FAILED: Duration = Duration::from_secs(600);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Task {
+    Head(Date),
+    Recent(Date),
+    Backfill(Date),
+    Recheck(Date),
+}
+
+impl Task {
+    pub fn date(&self) -> Date {
+        match *self {
+            Task::Head(d) | Task::Recent(d) | Task::Backfill(d) | Task::Recheck(d) => d,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Task::Head(_) => "head",
+            Task::Recent(_) => "recent",
+            Task::Backfill(_) => "backfill",
+            Task::Recheck(_) => "recheck",
+        }
+    }
+}
+
+// `days` must be sorted by date ascending, as `Store::days` returns them.
+pub fn next_task(
+    days: &[(Date, Timestamp)],
+    today: Date,
+    now: Timestamp,
+    last_slot_was_backfill: bool,
+) -> Option<Task> {
+    let Some(&(newest, _)) = days.last() else {
+        return Some(Task::Head(today));
+    };
+    if newest < today {
+        return Some(Task::Head(today));
+    }
+    let elapsed = |v: Timestamp| now.duration_since(v).as_secs();
+    let age = |d: Date| (today - d).get_days();
+
+    let recent = days
+        .iter()
+        .filter(|&&(d, _)| age(d) <= RECENT_DAYS)
+        .filter_map(|&(d, v)| {
+            let every = if age(d) <= DAILY_DAYS { 1 } else { 7 } * DAY_SECS;
+            let overdue = elapsed(v) - every;
+            (overdue > 0).then_some((overdue, d))
+        })
+        .max_by_key(|&(overdue, _)| overdue);
+    if let Some((_, d)) = recent {
+        return Some(Task::Recent(d));
+    }
+
+    let mut run_start = newest;
+    for &(d, _) in days.iter().rev().skip(1) {
+        if d.tomorrow().ok() != Some(run_start) {
+            break;
+        }
+        run_start = d;
+    }
+    let backfill = run_start
+        .yesterday()
+        .ok()
+        .filter(|&d| d >= crate::ndl::FLOOR)
+        .map(Task::Backfill);
+    let recheck = days
+        .iter()
+        .filter(|&&(d, v)| age(d) > RECENT_DAYS && elapsed(v) > OLD_RECHECK_SECS)
+        .min_by_key(|&&(_, v)| v)
+        .map(|&(d, _)| Task::Recheck(d));
+    if last_slot_was_backfill {
+        recheck.or(backfill)
+    } else {
+        backfill.or(recheck)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct RunState {
+    last_slot_was_backfill: bool,
+    deferred: Option<Task>,
+    just_deferred: bool,
+}
+
+pub fn jst_date(now: Timestamp) -> Date {
+    // NDL dates are Japanese; Japan has no daylight saving time.
+    now.to_zoned(jiff::tz::TimeZone::fixed(jiff::tz::offset(9)))
+        .date()
+}
+
+pub fn step(
+    http: &dyn Http,
+    store: &Store,
+    state: &mut RunState,
+    today: Date,
+    now: Timestamp,
+    sleep: &dyn Fn(Duration),
+    progress: &Progress,
+) -> anyhow::Result<()> {
+    let task = match state.deferred.take() {
+        Some(t) if !state.just_deferred => Some(t),
+        deferred => {
+            state.just_deferred = false;
+            let days = store.days()?;
+            let next = next_task(&days, today, now, state.last_slot_was_backfill);
+            if next.map(|t| t.date()) != deferred.map(|t| t.date()) {
+                state.deferred = deferred;
+            }
+            next
+        }
+    };
+    let Some(task) = task else {
+        progress.sleeping(IDLE, "nothing due");
+        sleep(IDLE);
+        return Ok(());
+    };
+    match task {
+        Task::Backfill(_) => state.last_slot_was_backfill = true,
+        Task::Recheck(_) => state.last_slot_was_backfill = false,
+        _ => {}
+    }
+    let wait = match crawl_day(http, store, task.date(), &|| now) {
+        Ok(DayOutcome::Applied(report)) => {
+            progress.applied(&task, &report);
+            return Ok(());
+        }
+        Ok(DayOutcome::Inconsistent(why)) => {
+            progress.failed(&task, &format!("inconsistent, will retry: {why}"));
+            state.deferred = Some(task);
+            state.just_deferred = true;
+            return Ok(());
+        }
+        Err(CrawlError::Store(e)) => return Err(e),
+        Err(CrawlError::Busy) => {
+            progress.failed(&task, "NDL busy");
+            BUSY
+        }
+        Err(e) => {
+            progress.failed(&task, &e.to_string());
+            FAILED
+        }
+    };
+    progress.sleeping(wait, "backing off");
+    sleep(wait);
+    Ok(())
+}
+
+pub fn run(http: &dyn Http, store: &Store, progress: &Progress) -> anyhow::Result<()> {
+    let sleep = |d: Duration| std::thread::sleep(d);
+    sleep(Duration::from_secs_f64(NDL_SPACING));
+    let mut state = RunState::default();
+    loop {
+        let now = Timestamp::now();
+        step(
+            http,
+            store,
+            &mut state,
+            jst_date(now),
+            now,
+            &sleep,
+            progress,
+        )?;
+    }
+}
+
+pub fn lock_database(path: &Path) -> anyhow::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    file.try_lock().map_err(|_| {
+        anyhow::anyhow!(
+            "another crawler holds {}; only one may run per database",
+            path.display()
+        )
+    })?;
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -259,5 +453,308 @@ mod tests {
             *http.log.lock().unwrap(),
             [day_url(day(), 1), day_url(day(), 3)]
         );
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+    use crate::ndl::FLOOR;
+    use jiff::civil::date;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    fn ts(s: &str) -> Timestamp {
+        s.parse().unwrap()
+    }
+
+    fn now() -> Timestamp {
+        ts("2026-11-03T03:00:00Z")
+    }
+
+    fn today() -> Date {
+        date(2026, 11, 3)
+    }
+
+    fn days_back(from_age: i32, to_age: i32, verified: Timestamp) -> Vec<(Date, Timestamp)> {
+        (to_age..=from_age)
+            .rev()
+            .map(|a| {
+                (
+                    today().checked_sub(jiff::Span::new().days(a)).unwrap(),
+                    verified,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn head_days_come_first_newest_first() {
+        assert_eq!(
+            next_task(&[], today(), now(), false),
+            Some(Task::Head(today()))
+        );
+        let days = vec![(date(2026, 10, 29), now()), (date(2026, 10, 28), now())];
+        let mut days = days;
+        days.sort();
+        assert_eq!(
+            next_task(&days, today(), now(), false),
+            Some(Task::Head(today()))
+        );
+    }
+
+    #[test]
+    fn recent_days_are_rechecked_daily_then_weekly() {
+        let two_days = now() - jiff::SignedDuration::from_hours(48);
+        let three_days = now() - jiff::SignedDuration::from_hours(72);
+        let fresh = now();
+        let mut days = days_back(60, 0, fresh);
+        days[0].1 = three_days; // age 60: weekly, not due
+        let age10 = days
+            .iter()
+            .position(|&(d, _)| (today() - d).get_days() == 10)
+            .unwrap();
+        days[age10].1 = two_days; // age 10: daily, due
+        assert_eq!(
+            next_task(&days, today(), now(), false),
+            Some(Task::Recent(days[age10].0))
+        );
+        days[age10].1 = fresh;
+        let backfill = days[0].0.yesterday().unwrap();
+        assert_eq!(
+            next_task(&days, today(), now(), false),
+            Some(Task::Backfill(backfill))
+        );
+    }
+
+    #[test]
+    fn most_overdue_recent_day_goes_first() {
+        let mut days = days_back(5, 0, now());
+        days[0].1 = now() - jiff::SignedDuration::from_hours(30);
+        days[1].1 = now() - jiff::SignedDuration::from_hours(60);
+        assert_eq!(
+            next_task(&days, today(), now(), false),
+            Some(Task::Recent(days[1].0))
+        );
+    }
+
+    #[test]
+    fn backfill_and_old_recheck_alternate() {
+        let old = now() - jiff::SignedDuration::from_hours(24 * 40);
+        let mut days = days_back(400, 0, now());
+        days[10].1 = old;
+        let oldest = days[0].0;
+        assert_eq!(
+            next_task(&days, today(), now(), false),
+            Some(Task::Backfill(oldest.yesterday().unwrap()))
+        );
+        assert_eq!(
+            next_task(&days, today(), now(), true),
+            Some(Task::Recheck(days[10].0))
+        );
+        days[10].1 = now();
+        assert_eq!(
+            next_task(&days, today(), now(), true),
+            Some(Task::Backfill(oldest.yesterday().unwrap()))
+        );
+    }
+
+    #[test]
+    fn backfill_stops_at_the_floor() {
+        let old = now() - jiff::SignedDuration::from_hours(24 * 40);
+        let mut days = vec![(FLOOR, old)];
+        let mut d = FLOOR;
+        while d < today() {
+            d = d.tomorrow().unwrap();
+            days.push((d, now()));
+        }
+        assert_eq!(
+            next_task(&days, today(), now(), false),
+            Some(Task::Recheck(FLOOR))
+        );
+        assert_eq!(
+            next_task(&days, today(), now(), true),
+            Some(Task::Recheck(FLOOR))
+        );
+    }
+
+    #[test]
+    fn nothing_due_is_none() {
+        let mut days = vec![(FLOOR, now())];
+        let mut d = FLOOR;
+        while d < today() {
+            d = d.tomorrow().unwrap();
+            days.push((d, now()));
+        }
+        assert_eq!(next_task(&days, today(), now(), false), None);
+        assert_eq!(next_task(&days, today(), now(), true), None);
+    }
+
+    #[test]
+    fn backfill_starts_below_the_newest_contiguous_run() {
+        let mut days = days_back(3, 0, now());
+        days.insert(0, (date(2026, 1, 1), now()));
+        assert_eq!(
+            next_task(&days, today(), now(), false),
+            Some(Task::Backfill(
+                today().checked_sub(jiff::Span::new().days(4)).unwrap()
+            ))
+        );
+    }
+
+    struct Fake {
+        pages: HashMap<String, Vec<u8>>,
+        log: Mutex<Vec<String>>,
+    }
+
+    impl Http for Fake {
+        fn get(&self, url: &str) -> Result<Vec<u8>, HttpError> {
+            self.log.lock().unwrap().push(url.to_string());
+            self.pages
+                .get(url)
+                .cloned()
+                .ok_or_else(|| HttpError::GaveUp(format!("no page for {url}")))
+        }
+    }
+
+    struct Harness {
+        _dir: tempfile::TempDir,
+        store: Store,
+        state: RunState,
+        today: Date,
+        slept: RefCell<Vec<Duration>>,
+        text: Arc<Mutex<Vec<u8>>>,
+        progress: Progress,
+    }
+
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Harness {
+        fn new() -> Harness {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("t.db")).unwrap();
+            let text = Arc::new(Mutex::new(Vec::new()));
+            Harness {
+                _dir: dir,
+                store,
+                state: RunState::default(),
+                today: today(),
+                slept: RefCell::new(vec![]),
+                progress: Progress::new(Box::new(Sink(text.clone()))),
+                text,
+            }
+        }
+
+        fn step(&mut self, http: &Fake) {
+            let slept = &self.slept;
+            step(
+                http,
+                &self.store,
+                &mut self.state,
+                self.today,
+                now(),
+                &|d| slept.borrow_mut().push(d),
+                &self.progress,
+            )
+            .unwrap();
+        }
+
+        fn output(&self) -> String {
+            String::from_utf8(self.text.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    fn fake(pages: Vec<(Date, &str)>) -> Fake {
+        Fake {
+            pages: pages
+                .into_iter()
+                .map(|(d, body)| (day_url(d, 1), body.as_bytes().to_vec()))
+                .collect(),
+            log: Mutex::new(vec![]),
+        }
+    }
+
+    #[test]
+    fn busy_body_backs_off() {
+        let mut h = Harness::new();
+        let http = fake(vec![(today(), r#"{"message":"(19001) busy"}"#)]);
+        h.step(&http);
+        assert_eq!(*h.slept.borrow(), [Duration::from_secs(300)]);
+        assert_eq!(h.store.days().unwrap().len(), 0);
+        assert!(h.output().contains("busy"), "{}", h.output());
+    }
+
+    #[test]
+    fn failed_request_backs_off_ten_minutes() {
+        let mut h = Harness::new();
+        h.step(&fake(vec![]));
+        assert_eq!(*h.slept.borrow(), [Duration::from_secs(600)]);
+    }
+
+    #[test]
+    fn applied_day_is_logged_without_sleeping() {
+        let mut h = Harness::new();
+        let http = fake(vec![(today(), r#"{"numberOfRecords":0}"#)]);
+        h.step(&http);
+        assert!(h.slept.borrow().is_empty());
+        assert_eq!(h.store.days().unwrap().len(), 1);
+        assert!(h.output().contains("head 2026-11-03"), "{}", h.output());
+    }
+
+    #[test]
+    fn inconsistent_day_is_retried_after_the_next_task() {
+        let fixture = |n: &str| std::fs::read(format!("tests/fixtures/{n}")).unwrap();
+        let shifted = String::from_utf8(fixture("meeting_day_p2.json"))
+            .unwrap()
+            .replace("\"numberOfRecords\": 3", "\"numberOfRecords\": 4");
+        let target = date(2026, 10, 20);
+        let old = date(2026, 3, 1);
+        let mut pages = HashMap::new();
+        pages.insert(day_url(target, 1), fixture("meeting_day_p1.json"));
+        pages.insert(day_url(target, 3), shifted.into_bytes());
+        pages.insert(day_url(old, 1), br#"{"numberOfRecords":0}"#.to_vec());
+        let http = Fake {
+            pages,
+            log: Mutex::new(vec![]),
+        };
+        let mut h = Harness::new();
+        let stale = now() - jiff::SignedDuration::from_hours(24 * 40);
+        h.store.apply_day(date(2026, 10, 21), &[], now()).unwrap();
+        h.store.apply_day(old, &[], stale).unwrap();
+        h.today = date(2026, 10, 21);
+        for _ in 0..3 {
+            h.step(&http);
+        }
+        let starts = |d: Date| day_url(d, 1);
+        let log = http.log.lock().unwrap().clone();
+        let firsts: Vec<_> = log
+            .iter()
+            .filter(|u| **u == starts(target) || **u == starts(old))
+            .map(|u| if *u == starts(old) { "old" } else { "target" })
+            .collect();
+        assert_eq!(firsts, ["target", "old", "target"], "{log:?}");
+        assert!(h.output().contains("will retry"), "{}", h.output());
+    }
+
+    #[test]
+    fn second_crawler_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.sqlite");
+        let first = lock_database(&path).unwrap();
+        let err = lock_database(&path).unwrap_err();
+        assert!(err.to_string().contains("another crawler"), "{err}");
+        drop(first);
+        lock_database(&path).unwrap();
     }
 }
