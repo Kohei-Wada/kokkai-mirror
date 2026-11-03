@@ -1,0 +1,108 @@
+{
+ "numberOfRecords": 3,
+ "numberOfReturn": 2,
+ "startRecord": 1,
+ "nextRecordPosition": 3,
+ "meetingRecord": [
+  {
+   "issueID": "999900001X00120261020",
+   "imageKind": "会議録",
+   "searchObject": 0,
+   "session": 999,
+   "nameOfHouse": "衆議院",
+   "nameOfMeeting": "架空委員会",
+   "issue": "第1号",
+   "date": "2026-10-20",
+   "closing": null,
+   "speechRecord": [
+    {
+     "speechID": "999900001X00120261020_000",
+     "speechOrder": 0,
+     "speaker": "会議録情報",
+     "speakerYomi": null,
+     "speakerGroup": null,
+     "speakerPosition": null,
+     "speakerRole": null,
+     "speech": "令和八年十月二十日\r\n　出席者　架空太郎君（a）",
+     "startPage": 0,
+     "createTime": "2026-10-23 19:42:14",
+     "updateTime": "2026-10-23 19:42:14",
+     "speechURL": "https://kokkai.ndl.go.jp/txt/999900001X00120261020/0"
+    },
+    {
+     "speechID": "999900001X00120261020_001",
+     "speechOrder": 1,
+     "speaker": "架空太郎",
+     "speakerYomi": "かくうたろう",
+     "speakerGroup": "架空党",
+     "speakerPosition": null,
+     "speakerRole": "委員長",
+     "speech": "これより会議を開きます。",
+     "startPage": 1,
+     "createTime": "2026-10-23 19:42:14",
+     "updateTime": "2026-11-01 08:00:00",
+     "speechURL": "https://kokkai.ndl.go.jp/txt/999900001X00120261020/1"
+    },
+    {
+     "speechID": "999900001X00120261020_002",
+     "speechOrder": 2,
+     "speaker": "見本花子",
+     "speakerYomi": "みほんはなこ",
+     "speakerGroup": "試験会",
+     "speakerPosition": "大臣",
+     "speakerRole": "国務大臣",
+     "speech": "お答えいたします。",
+     "startPage": 2,
+     "createTime": "2026-10-23 19:42:14",
+     "updateTime": "2026-10-23 19:42:14",
+     "speechURL": "https://kokkai.ndl.go.jp/txt/999900001X00120261020/2"
+    }
+   ],
+   "meetingURL": "https://kokkai.ndl.go.jp/txt/999900001X00120261020",
+   "pdfURL": null
+  },
+  {
+   "issueID": "999900002X00220261020",
+   "imageKind": "会議録",
+   "searchObject": 0,
+   "session": 999,
+   "nameOfHouse": "参議院",
+   "nameOfMeeting": "試験本会議",
+   "issue": "第2号",
+   "date": "2026-10-20",
+   "closing": "散会",
+   "speechRecord": [
+    {
+     "speechID": "999900002X00220261020_000",
+     "speechOrder": 0,
+     "speaker": "会議録情報",
+     "speakerYomi": null,
+     "speakerGroup": null,
+     "speakerPosition": null,
+     "speakerRole": null,
+     "speech": "令和八年十月二十日\r\n　出席者　架空太郎君（b）",
+     "startPage": 0,
+     "createTime": "2026-10-23 19:42:14",
+     "updateTime": "2026-10-23 19:42:14",
+     "speechURL": "https://kokkai.ndl.go.jp/txt/999900002X00220261020/0"
+    },
+    {
+     "speechID": "999900002X00220261020_001",
+     "speechOrder": 1,
+     "speaker": "架空太郎",
+     "speakerYomi": "かくうたろう",
+     "speakerGroup": "架空党",
+     "speakerPosition": null,
+     "speakerRole": "議長",
+     "speech": "本日はこれで散会します。",
+     "startPage": 1,
+     "createTime": "2026-10-23 19:42:14",
+     "updateTime": "2026-11-01 08:00:00",
+     "speechURL": "https://kokkai.ndl.go.jp/txt/999900002X00220261020/1"
+    }
+   ],
+   "meetingURL": "https://kokkai.ndl.go.jp/txt/999900002X00220261020",
+   "pdfURL": "https://example.invalid/m2.pdf"
+  }
+ ]
+}
