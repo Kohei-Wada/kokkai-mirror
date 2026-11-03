@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use kokkai_mirror::crawl::{lock_database, run};
 use kokkai_mirror::http::{user_agent, Client};
 use kokkai_mirror::progress::Progress;
+use kokkai_mirror::serve::serve;
 use kokkai_mirror::store::Store;
 
 #[derive(Parser)]
@@ -24,6 +25,15 @@ enum Command {
         #[arg(long)]
         user_agent: String,
     },
+    /// Serve the mirrored data over HTTP, read-only
+    Serve {
+        /// SQLite database file
+        #[arg(long)]
+        db: PathBuf,
+        /// Address to listen on
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -37,5 +47,6 @@ fn main() -> anyhow::Result<()> {
             let store = Store::open(&db)?;
             run(&Client::new(ua), &store, &Progress::stderr())
         }
+        Command::Serve { db, listen } => serve(&Store::open_read_only(&db)?, listen.as_str()),
     }
 }
