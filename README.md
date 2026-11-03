@@ -22,15 +22,19 @@ kokkai-mirror serve --db <DB> [--listen <ADDR>]
 
 ## Pace
 
-The crawler waits 3 seconds before its first request and 3 seconds after each response is fully received, and honours 429/5xx with backoff and `Retry-After`. There is no flag, environment variable or code path that makes it faster.
+The crawler waits 3 seconds before its first request and 3 seconds after each response is fully received, and retries network errors, 408, 429 and 5xx with backoff (five attempts per request, then a 10-minute pause). A `Retry-After` on 429 or 503 is honoured at any length, as seconds or as an HTTP date. There is no flag, environment variable or code path that makes it faster.
 
 Order of work:
 
-1. New days first: from today (JST) back to the newest crawled day.
+1. New days first: any missing day between today (JST) and the oldest crawled day, newest first.
 2. Re-checks of recent days: days up to 30 days old daily, 31 to 180 days old weekly. The NDL registers and corrects records late (a meeting created three days after it was held, a whole meeting updated months later), so recent days are checked again and again.
 3. Backfill towards 1947-05-20, the first meeting, alternating with re-checks of older days (a day older than 180 days is re-checked at most every 30 days).
 
-The crawl unit is one meeting day (`/api/meeting` with `maximumRecords=10`), about one request per day of the calendar plus one per 10 meetings. The recent weeks are there within minutes; the full backfill takes on the order of days. The NDL Lab puts the text of everything at about 7.8 GB; the file also holds the kept versions.
+A day that fails (an HTTP failure, an NDL error other than "busy", or an answer that is inconsistent across its pages) is put aside and retried after 1 hour, then 2, 4, ... up to 7 days, while the other work goes on; the backfill passes it, and coverage ends at it until it is crawled. This schedule is kept in memory and starts over when the crawler restarts.
+
+The crawl unit is one meeting day (`/api/meeting` with `maximumRecords=10`), about one request per day of the calendar plus one per 10 meetings. The recent weeks are there within minutes; the full backfill takes on the order of days. The NDL Lab puts the text of everything at about 7.8 GB; the database file is larger, since it also holds every raw response page, every kept version and the full-text index.
+
+Only response bodies the NDL returned with a success status are stored (including NDL error messages sent that way). HTTP error responses (4xx/5xx) are not stored.
 
 ## Before a full crawl
 
@@ -51,14 +55,14 @@ Supported parameters: `startRecord`, `maximumRecords`, `nameOfHouse`, `nameOfMee
 Mirror-only, never mixed into the NDL-shaped answers:
 
 - `GET /mirror/coverage`: `{"from", "until"}`, the range held completely (both `null` when nothing is held yet).
-- `GET /mirror/record?issueID=<id>` (or `speechID=<id>`): the versions of the meeting (`sha256`, `first_seen`, `last_seen`, source `url`), `last_verified` and `dropped_at`. Add `&version=<sha256>` to get that stored version of the record.
+- `GET /mirror/record?issueID=<id>` (or `speechID=<id>`): the versions of the meeting (`sha256`, `first_seen`, `last_seen`, source `url`), `last_verified` and `dropped_at`. Add `&version=<sha256>` to get that stored version of the record. When the content flips back to an earlier version, that version's `first_seen`..`last_seen` span overlaps the others; `/mirror/changes` is the authoritative history.
 - `GET /mirror/changes?from=YYYY-MM-DD&until=YYYY-MM-DD`: the days checked, the oldest and newest verification time, and the detected changes (`changed`, `dropped`, `returned`, ...) in that range.
 
 A meeting the NDL stops returning stays in its versions, leaves the NDL-shaped answers, and shows up in `/mirror/changes`.
 
 ## Coverage and the `mirror` note
 
-The mirror answers only for the range of consecutive days it holds completely, ending at the newest crawled day. A query reaching outside it (a query without dates counts as all time, so it is refused until the backfill reaches 1947) gets HTTP 400 with the range stated. Every answer, and every mirror-own error, carries a top-level object:
+The mirror answers only for the range of consecutive days it holds completely, ending at the newest crawled day. A query reaching outside it (a query without dates counts as all time, so it is refused until the backfill reaches 1947) gets HTTP 400 with the range stated. Every `/api/*` answer and mirror-own `/api/*` error carries a top-level object (NDL input errors, below, are answered exactly as the NDL does, without it):
 
 ```json
 "mirror": {"coverage": {"from": "YYYY-MM-DD", "until": "YYYY-MM-DD"}, "approximate": ["order"]}
