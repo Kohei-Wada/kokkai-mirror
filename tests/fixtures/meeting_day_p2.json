@@ -1,0 +1,79 @@
+{
+ "numberOfRecords": 3,
+ "numberOfReturn": 1,
+ "startRecord": 3,
+ "nextRecordPosition": null,
+ "meetingRecord": [
+  {
+   "issueID": "999900003X00320261020",
+   "imageKind": "会議録",
+   "searchObject": 0,
+   "session": 999,
+   "nameOfHouse": "参議院",
+   "nameOfMeeting": "試験調査会",
+   "issue": "第3号",
+   "date": "2026-10-20",
+   "closing": null,
+   "speechRecord": [
+    {
+     "speechID": "999900003X00320261020_000",
+     "speechOrder": 0,
+     "speaker": "会議録情報",
+     "speakerYomi": null,
+     "speakerGroup": null,
+     "speakerPosition": null,
+     "speakerRole": null,
+     "speech": "令和八年十月二十日\r\n　出席者　架空太郎君（c）",
+     "startPage": 0,
+     "createTime": "2026-10-23 19:42:14",
+     "updateTime": "2026-10-23 19:42:14",
+     "speechURL": "https://kokkai.ndl.go.jp/txt/999900003X00320261020/0"
+    },
+    {
+     "speechID": "999900003X00320261020_001",
+     "speechOrder": 1,
+     "speaker": "見本花子",
+     "speakerYomi": "みほんはなこ",
+     "speakerGroup": null,
+     "speakerPosition": null,
+     "speakerRole": null,
+     "speech": "以上です。",
+     "startPage": 1,
+     "createTime": "2026-10-23 19:42:14",
+     "updateTime": "2026-11-01 08:00:00",
+     "speechURL": "https://kokkai.ndl.go.jp/txt/999900003X00320261020/1"
+    },
+    {
+     "speechID": "999900003X00320261020_002",
+     "speechOrder": 2,
+     "speaker": "架空太郎",
+     "speakerYomi": "かくうたろう",
+     "speakerGroup": "架空党",
+     "speakerPosition": null,
+     "speakerRole": null,
+     "speech": "了解しました。",
+     "startPage": 2,
+     "createTime": "2026-10-23 19:42:14",
+     "updateTime": "2026-10-23 19:42:14",
+     "speechURL": "https://kokkai.ndl.go.jp/txt/999900003X00320261020/2"
+    },
+    {
+     "speechID": "999900003X00320261020_003",
+     "speechOrder": 3,
+     "speaker": "見本花子",
+     "speakerYomi": "みほんはなこ",
+     "speakerGroup": null,
+     "speakerPosition": null,
+     "speakerRole": null,
+     "speech": "終わります。",
+     "startPage": 3,
+     "createTime": "2026-10-23 19:42:14",
+     "updateTime": "2026-11-01 08:00:00",
+     "speechURL": "https://kokkai.ndl.go.jp/txt/999900003X00320261020/3"
+    }
+   ],
+   "meetingURL": "https://kokkai.ndl.go.jp/txt/999900003X00320261020",
+   "pdfURL": null
+  }
+ ]
+}
