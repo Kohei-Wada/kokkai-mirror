@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::crawl::Task;
+use crate::http::{Http, HttpError};
 use crate::store::DayReport;
 
 pub struct Progress {
@@ -40,8 +41,34 @@ impl Progress {
         self.line(&format!("sleep {}s: {why}", wait.as_secs()));
     }
 
+    pub fn request(&self, url: &str, result: &str) {
+        self.line(&format!("{} GET {url} {result}", jiff::Timestamp::now()));
+    }
+
     fn line(&self, text: &str) {
         let mut out = self.out.lock().unwrap();
         let _ = writeln!(out, "{text}");
+    }
+}
+
+pub struct LoggedHttp<'a> {
+    inner: &'a dyn Http,
+    progress: &'a Progress,
+}
+
+impl<'a> LoggedHttp<'a> {
+    pub fn new(inner: &'a dyn Http, progress: &'a Progress) -> LoggedHttp<'a> {
+        LoggedHttp { inner, progress }
+    }
+}
+
+impl Http for LoggedHttp<'_> {
+    fn get(&self, url: &str) -> Result<Vec<u8>, HttpError> {
+        let result = self.inner.get(url);
+        match &result {
+            Ok(_) => self.progress.request(url, "ok"),
+            Err(e) => self.progress.request(url, &e.to_string()),
+        }
+        result
     }
 }

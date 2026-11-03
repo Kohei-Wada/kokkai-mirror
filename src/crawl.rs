@@ -8,7 +8,7 @@ use jiff::Timestamp;
 
 use crate::http::{Http, HttpError, NDL_SPACING};
 use crate::ndl::{day_url, parse_page, Meeting, NdlError};
-use crate::progress::Progress;
+use crate::progress::{LoggedHttp, Progress};
 use crate::store::{DayReport, Store};
 
 #[derive(Debug)]
@@ -140,18 +140,37 @@ pub fn next_task(
     now: Timestamp,
     last_slot_was_backfill: bool,
 ) -> Option<Task> {
+    next_task_skipping(days, today, now, last_slot_was_backfill, None)
+}
+
+fn next_task_skipping(
+    days: &[(Date, Timestamp)],
+    today: Date,
+    now: Timestamp,
+    last_slot_was_backfill: bool,
+    skip: Option<Date>,
+) -> Option<Task> {
     let Some(&(newest, _)) = days.last() else {
-        return Some(Task::Head(today));
+        return Some(Task::Head(today)).filter(|t| Some(t.date()) != skip);
     };
-    if newest < today {
-        return Some(Task::Head(today));
+    // Head: the newest missing day above the oldest crawled day.
+    let known: BTreeSet<Date> = days.iter().map(|&(d, _)| d).collect();
+    let oldest = days[0].0;
+    let mut d = today;
+    while d > oldest {
+        if !known.contains(&d) && Some(d) != skip {
+            return Some(Task::Head(d));
+        }
+        d = d.yesterday().ok()?;
     }
+
     let elapsed = |v: Timestamp| now.duration_since(v).as_secs();
     let age = |d: Date| (today - d).get_days();
+    let eligible = |d: Date| Some(d) != skip;
 
     let recent = days
         .iter()
-        .filter(|&&(d, _)| age(d) <= RECENT_DAYS)
+        .filter(|&&(d, _)| age(d) <= RECENT_DAYS && eligible(d))
         .filter_map(|&(d, v)| {
             let every = if age(d) <= DAILY_DAYS { 1 } else { 7 } * DAY_SECS;
             let overdue = elapsed(v) - every;
@@ -172,11 +191,12 @@ pub fn next_task(
     let backfill = run_start
         .yesterday()
         .ok()
-        .filter(|&d| d >= crate::ndl::FLOOR)
+        .filter(|&d| d >= crate::ndl::FLOOR && eligible(d))
         .map(Task::Backfill);
+    // "Nothing due" exists only because old days are re-checked just after OLD_RECHECK_SECS.
     let recheck = days
         .iter()
-        .filter(|&&(d, v)| age(d) > RECENT_DAYS && elapsed(v) > OLD_RECHECK_SECS)
+        .filter(|&&(d, v)| age(d) > RECENT_DAYS && elapsed(v) > OLD_RECHECK_SECS && eligible(d))
         .min_by_key(|&&(_, v)| v)
         .map(|&(d, _)| Task::Recheck(d));
     if last_slot_was_backfill {
@@ -190,7 +210,7 @@ pub fn next_task(
 pub struct RunState {
     last_slot_was_backfill: bool,
     deferred: Option<Task>,
-    just_deferred: bool,
+    ran_other_since_deferred: bool,
 }
 
 pub fn jst_date(now: Timestamp) -> Date {
@@ -204,25 +224,34 @@ pub fn step(
     store: &Store,
     state: &mut RunState,
     today: Date,
-    now: Timestamp,
+    clock: &dyn Fn() -> Timestamp,
     sleep: &dyn Fn(Duration),
     progress: &Progress,
 ) -> anyhow::Result<()> {
-    let task = match state.deferred.take() {
-        Some(t) if !state.just_deferred => Some(t),
-        deferred => {
-            state.just_deferred = false;
-            let days = store.days()?;
-            let next = next_task(&days, today, now, state.last_slot_was_backfill);
-            if next.map(|t| t.date()) != deferred.map(|t| t.date()) {
-                state.deferred = deferred;
-            }
+    let http = LoggedHttp::new(http, progress);
+    let retry = state.deferred.is_some() && state.ran_other_since_deferred;
+    let task = if retry {
+        state.ran_other_since_deferred = false;
+        state.deferred.take()
+    } else {
+        let days = store.days()?;
+        let skip = state.deferred.map(|t| t.date());
+        let next = next_task_skipping(&days, today, clock(), state.last_slot_was_backfill, skip);
+        if next.is_some() {
+            state.ran_other_since_deferred = true;
             next
+        } else if state.deferred.is_some() {
+            progress.sleeping(IDLE, "only a deferred day is left");
+            sleep(IDLE);
+            state.ran_other_since_deferred = false;
+            state.deferred.take()
+        } else {
+            progress.sleeping(IDLE, "nothing due");
+            sleep(IDLE);
+            return Ok(());
         }
     };
     let Some(task) = task else {
-        progress.sleeping(IDLE, "nothing due");
-        sleep(IDLE);
         return Ok(());
     };
     match task {
@@ -230,7 +259,7 @@ pub fn step(
         Task::Recheck(_) => state.last_slot_was_backfill = false,
         _ => {}
     }
-    let wait = match crawl_day(http, store, task.date(), &|| now) {
+    let wait = match crawl_day(&http, store, task.date(), clock) {
         Ok(DayOutcome::Applied(report)) => {
             progress.applied(&task, &report);
             return Ok(());
@@ -238,7 +267,7 @@ pub fn step(
         Ok(DayOutcome::Inconsistent(why)) => {
             progress.failed(&task, &format!("inconsistent, will retry: {why}"));
             state.deferred = Some(task);
-            state.just_deferred = true;
+            state.ran_other_since_deferred = false;
             return Ok(());
         }
         Err(CrawlError::Store(e)) => return Err(e),
@@ -248,6 +277,8 @@ pub fn step(
         }
         Err(e) => {
             progress.failed(&task, &e.to_string());
+            state.deferred = Some(task);
+            state.ran_other_since_deferred = false;
             FAILED
         }
     };
@@ -261,13 +292,13 @@ pub fn run(http: &dyn Http, store: &Store, progress: &Progress) -> anyhow::Resul
     sleep(Duration::from_secs_f64(NDL_SPACING));
     let mut state = RunState::default();
     loop {
-        let now = Timestamp::now();
+        let today = jst_date(Timestamp::now());
         step(
             http,
             store,
             &mut state,
-            jst_date(now),
-            now,
+            today,
+            &Timestamp::now,
             &sleep,
             progress,
         )?;
@@ -495,13 +526,22 @@ mod scheduler_tests {
             next_task(&[], today(), now(), false),
             Some(Task::Head(today()))
         );
-        let days = vec![(date(2026, 10, 29), now()), (date(2026, 10, 28), now())];
-        let mut days = days;
-        days.sort();
-        assert_eq!(
+        let mut days = vec![(date(2026, 10, 28), now()), (date(2026, 10, 29), now())];
+        for expected in [date(2026, 11, 3), date(2026, 11, 2), date(2026, 11, 1)]
+            .into_iter()
+            .chain([date(2026, 10, 31), date(2026, 10, 30)])
+        {
+            assert_eq!(
+                next_task(&days, today(), now(), false),
+                Some(Task::Head(expected))
+            );
+            days.push((expected, now()));
+            days.sort();
+        }
+        assert!(!matches!(
             next_task(&days, today(), now(), false),
-            Some(Task::Head(today()))
-        );
+            Some(Task::Head(_))
+        ));
     }
 
     #[test]
@@ -593,8 +633,7 @@ mod scheduler_tests {
 
     #[test]
     fn backfill_starts_below_the_newest_contiguous_run() {
-        let mut days = days_back(3, 0, now());
-        days.insert(0, (date(2026, 1, 1), now()));
+        let days = days_back(3, 0, now());
         assert_eq!(
             next_task(&days, today(), now(), false),
             Some(Task::Backfill(
@@ -663,11 +702,22 @@ mod scheduler_tests {
                 &self.store,
                 &mut self.state,
                 self.today,
-                now(),
+                &now,
                 &|d| slept.borrow_mut().push(d),
                 &self.progress,
             )
             .unwrap();
+        }
+
+        fn fill(&self, from: Date, to: Date, skip: &[Date], stale_day: Date, stale: Timestamp) {
+            let mut d = from;
+            while d <= to {
+                if !skip.contains(&d) {
+                    let at = if d == stale_day { stale } else { now() };
+                    self.store.apply_day(d, &[], at).unwrap();
+                }
+                d = d.tomorrow().unwrap();
+            }
         }
 
         fn output(&self) -> String {
@@ -730,8 +780,7 @@ mod scheduler_tests {
         };
         let mut h = Harness::new();
         let stale = now() - jiff::SignedDuration::from_hours(24 * 40);
-        h.store.apply_day(date(2026, 10, 21), &[], now()).unwrap();
-        h.store.apply_day(old, &[], stale).unwrap();
+        h.fill(old, date(2026, 10, 21), &[target], old, stale);
         h.today = date(2026, 10, 21);
         for _ in 0..3 {
             h.step(&http);
@@ -745,6 +794,72 @@ mod scheduler_tests {
             .collect();
         assert_eq!(firsts, ["target", "old", "target"], "{log:?}");
         assert!(h.output().contains("will retry"), "{}", h.output());
+    }
+
+    #[test]
+    fn lone_inconsistent_day_waits_a_minute_before_its_retry() {
+        let fixture = |n: &str| std::fs::read(format!("tests/fixtures/{n}")).unwrap();
+        let shifted = String::from_utf8(fixture("meeting_day_p2.json"))
+            .unwrap()
+            .replace("\"numberOfRecords\": 3", "\"numberOfRecords\": 4");
+        let target = date(2026, 10, 20);
+        let mut pages = HashMap::new();
+        pages.insert(day_url(target, 1), fixture("meeting_day_p1.json"));
+        pages.insert(day_url(target, 3), shifted.into_bytes());
+        let http = Fake {
+            pages,
+            log: Mutex::new(vec![]),
+        };
+        let mut h = Harness::new();
+        h.today = target;
+        h.step(&http);
+        assert!(h.slept.borrow().is_empty());
+        h.step(&http);
+        assert_eq!(*h.slept.borrow(), [Duration::from_secs(60)]);
+        let starts = http
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|u| **u == day_url(target, 1))
+            .count();
+        assert_eq!(starts, 2);
+    }
+
+    #[test]
+    fn failed_day_does_not_block_other_due_days() {
+        let mut h = Harness::new();
+        let old = date(2026, 3, 1);
+        let stale = now() - jiff::SignedDuration::from_hours(24 * 40);
+        h.fill(old, today().yesterday().unwrap(), &[], old, stale);
+        let mut pages = HashMap::new();
+        pages.insert(day_url(old, 1), br#"{"numberOfRecords":0}"#.to_vec());
+        let http = Fake {
+            pages,
+            log: Mutex::new(vec![]),
+        };
+        h.step(&http);
+        assert_eq!(*h.slept.borrow(), [Duration::from_secs(600)]);
+        h.step(&http);
+        let log = http.log.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            [day_url(today(), 1), day_url(old.yesterday().unwrap(), 1)]
+        );
+    }
+
+    #[test]
+    fn every_request_is_logged_with_time_url_and_result() {
+        let mut h = Harness::new();
+        let http = fake(vec![(today(), r#"{"numberOfRecords":0}"#)]);
+        h.step(&http);
+        let out = h.output();
+        let line = out.lines().next().unwrap();
+        assert!(
+            line.contains(&day_url(today(), 1)) && line.ends_with("ok"),
+            "{out}"
+        );
+        assert!(line.starts_with("20"), "{out}");
     }
 
     #[test]
