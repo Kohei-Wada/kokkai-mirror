@@ -2,6 +2,8 @@ use std::io::Read;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use jiff::Timestamp;
+
 const ATTEMPTS: u32 = 5;
 const BACKOFF: f64 = 2.0;
 const RETRY_AFTER_CAP: f64 = 300.0;
@@ -11,6 +13,7 @@ pub const NDL_SPACING: f64 = 3.0;
 pub enum HttpError {
     NotFound(String),
     GaveUp(String),
+    RetryAfter { message: String, wait: Duration },
 }
 
 impl std::fmt::Display for HttpError {
@@ -18,6 +21,7 @@ impl std::fmt::Display for HttpError {
         match self {
             HttpError::NotFound(url) => write!(f, "404 {url}"),
             HttpError::GaveUp(msg) => f.write_str(msg),
+            HttpError::RetryAfter { message, .. } => f.write_str(message),
         }
     }
 }
@@ -36,12 +40,14 @@ enum Failure {
 type Opener = Box<dyn Fn(&str, &str) -> Result<Vec<u8>, Failure> + Send + Sync>;
 type Sleep = Box<dyn Fn(f64) + Send + Sync>;
 type Now = Box<dyn Fn() -> f64 + Send + Sync>;
+type Wall = Box<dyn Fn() -> Timestamp + Send + Sync>;
 
 pub struct Client {
     user_agent: String,
     opener: Opener,
     sleep: Sleep,
     now: Now,
+    wall: Wall,
     mark: Mutex<Option<f64>>,
 }
 
@@ -84,15 +90,17 @@ impl Client {
             Box::new(move |url, ua| urlopen(&agent, url, ua)),
             Box::new(|s| std::thread::sleep(Duration::from_secs_f64(s))),
             Box::new(move || epoch.elapsed().as_secs_f64()),
+            Box::new(Timestamp::now),
         )
     }
 
-    fn with(user_agent: String, opener: Opener, sleep: Sleep, now: Now) -> Client {
+    fn with(user_agent: String, opener: Opener, sleep: Sleep, now: Now, wall: Wall) -> Client {
         Client {
             user_agent,
             opener,
             sleep,
             now,
+            wall,
             mark: Mutex::new(None),
         }
     }
@@ -106,6 +114,17 @@ impl Client {
         }
         *mark = Some(now + wait);
     }
+}
+
+// RFC 9110 §10.2.3: delta-seconds or an HTTP-date.
+fn parse_retry_after(value: &str, now: Timestamp) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<f64>() {
+        return Duration::try_from_secs_f64(secs).ok();
+    }
+    static PARSER: jiff::fmt::rfc2822::DateTimeParser = jiff::fmt::rfc2822::DateTimeParser::new();
+    let at = PARSER.parse_timestamp(value).ok()?;
+    Some(Duration::try_from(at.duration_since(now)).unwrap_or(Duration::ZERO))
 }
 
 impl Http for Client {
@@ -127,14 +146,18 @@ impl Http for Client {
                 Err(Failure::Status(code, retry_after)) => {
                     last = format!("HTTP {code}");
                     if matches!(code, 429 | 503) {
-                        if let Some(secs) = retry_after
-                            .and_then(|v| v.trim().parse::<f64>().ok())
-                            .filter(|s| *s >= 0.0)
+                        if let Some(wait) = retry_after
+                            .as_deref()
+                            .and_then(|v| parse_retry_after(v, (self.wall)()))
                         {
+                            let secs = wait.as_secs_f64();
                             if secs > RETRY_AFTER_CAP {
-                                return Err(HttpError::GaveUp(format!(
-                                    "gave up: {url}: {last}, Retry-After {secs}s exceeds {RETRY_AFTER_CAP}s"
-                                )));
+                                return Err(HttpError::RetryAfter {
+                                    message: format!(
+                                        "gave up: {url}: {last}, Retry-After {secs}s exceeds {RETRY_AFTER_CAP}s"
+                                    ),
+                                    wait,
+                                });
                             }
                             pause = secs;
                         }
@@ -181,6 +204,7 @@ mod tests {
                 let mut t = clock.lock().unwrap();
                 t.next().unwrap_or(1e9)
             }),
+            Box::new(|| "2026-11-03T03:00:00Z".parse().unwrap()),
         );
         (client, seen, sleeps)
     }
@@ -224,18 +248,53 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_over_cap_gives_up() {
+    fn retry_after_over_cap_is_handed_to_the_caller() {
         let (c, seen, _) = client(
-            vec![Err(Failure::Status(429, Some("301".into()))), Ok(vec![])],
+            vec![Err(Failure::Status(429, Some("3600".into()))), Ok(vec![])],
             spread(10),
         );
-        assert!(matches!(c.get("https://x"), Err(HttpError::GaveUp(_))));
+        match c.get("https://x") {
+            Err(HttpError::RetryAfter { wait, message }) => {
+                assert_eq!(wait, Duration::from_secs(3600));
+                assert!(message.contains("https://x"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retry_after_http_date_is_honoured() {
+        let (c, _, sleeps) = client(
+            vec![
+                Err(Failure::Status(
+                    503,
+                    Some("Tue, 03 Nov 2026 03:01:00 GMT".into()),
+                )),
+                Ok(b"ok".to_vec()),
+            ],
+            spread(10),
+        );
+        assert_eq!(c.get("https://x").unwrap(), b"ok");
+        assert!(sleeps.lock().unwrap().contains(&60.0), "{sleeps:?}");
+
+        let (c, seen, _) = client(
+            vec![Err(Failure::Status(
+                503,
+                Some("Tue, 03 Nov 2026 05:00:00 GMT".into()),
+            ))],
+            spread(10),
+        );
+        assert!(matches!(
+            c.get("https://x"),
+            Err(HttpError::RetryAfter { wait, .. }) if wait == Duration::from_secs(7200)
+        ));
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[test]
     fn invalid_retry_after_falls_back_to_backoff() {
-        for value in ["-1", "NaN"] {
+        for value in ["-1", "NaN", "soon", "Tue, 03 Nov 2026 25:00:00 GMT"] {
             let (c, seen, sleeps) = client(
                 vec![
                     Err(Failure::Status(503, Some(value.into()))),

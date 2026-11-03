@@ -260,7 +260,7 @@ pub fn step(
         Task::Recheck(_) => state.last_slot_was_backfill = false,
         _ => {}
     }
-    let wait = match crawl_day(&http, store, task.date(), clock) {
+    let (wait, why) = match crawl_day(&http, store, task.date(), clock) {
         Ok(DayOutcome::Applied(report)) => {
             progress.applied(&task, &report);
             return Ok(());
@@ -274,16 +274,21 @@ pub fn step(
         Err(CrawlError::Store(e)) => return Err(e),
         Err(CrawlError::Busy) => {
             progress.failed(&task, "NDL busy");
-            BUSY
+            (BUSY, "backing off")
         }
         Err(e) => {
             progress.failed(&task, &e.to_string());
             state.deferred = Some(task);
             state.ran_other_since_deferred = false;
-            FAILED
+            match e {
+                CrawlError::Http(HttpError::RetryAfter { wait, .. }) => {
+                    (wait.max(FAILED), "Retry-After")
+                }
+                _ => (FAILED, "backing off"),
+            }
         }
     };
-    progress.sleeping(wait, "backing off");
+    progress.sleeping(wait, why);
     sleep(wait);
     Ok(())
 }
@@ -767,6 +772,33 @@ mod scheduler_tests {
         let mut h = Harness::new();
         h.step(&fake(vec![]));
         assert_eq!(*h.slept.borrow(), [Duration::from_secs(600)]);
+    }
+
+    #[test]
+    fn long_retry_after_is_honoured() {
+        struct Throttled;
+        impl Http for Throttled {
+            fn get(&self, url: &str) -> Result<Vec<u8>, HttpError> {
+                Err(HttpError::RetryAfter {
+                    message: format!("{url}: HTTP 429"),
+                    wait: Duration::from_secs(3600),
+                })
+            }
+        }
+        let mut h = Harness::new();
+        let slept = &h.slept;
+        step(
+            &Throttled,
+            &h.store,
+            &mut h.state,
+            h.today,
+            &now,
+            &|d| slept.borrow_mut().push(d),
+            &h.progress,
+        )
+        .unwrap();
+        assert_eq!(*h.slept.borrow(), [Duration::from_secs(3600)]);
+        assert!(h.output().contains("Retry-After"), "{}", h.output());
     }
 
     #[test]
