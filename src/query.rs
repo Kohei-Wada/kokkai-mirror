@@ -99,7 +99,7 @@ fn ndl_message(code: u32) -> &'static str {
         19007 => "検索条件を指定してください。",
         19012 => "from:開会日付をYYYY-MM-DD形式で入力してください。",
         19013 => "until:開会日付をYYYY-MM-DD形式で入力してください。",
-        19014 => "fromはuntil以下、もしくはuntilはfrom以上の日付で入力してください。",
+        19014 => "fromはuntil以下、もしくはuntilはfrom以上の西暦年で入力してください。",
         19018 => "from:存在しない日付です。検索条件を見直し、再度検索してください。",
         19019 => "until:存在しない日付です。検索条件を見直し、再度検索してください。",
         _ => "検索条件の入力に誤りがあります。",
@@ -132,14 +132,32 @@ fn body(obj: Obj) -> String {
     serde_json::to_string(&obj).expect("JSON values always serialize")
 }
 
-fn ndl_error(code: u32) -> Reply {
-    let message = format!("({code}){}", ndl_message(code));
+fn ndl_message_line(code: u32) -> String {
+    format!("({code}){}", ndl_message(code))
+}
+
+fn ndl_errors(codes: &[u32]) -> Reply {
+    let details: Vec<String> = codes
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("({i}) {}", ndl_message_line(*c)))
+        .collect();
     Reply {
-        status: 200,
+        status: 400,
         body: body(Obj(vec![
-            ("message", Field::Json(json!(message))),
-            ("details", Field::Json(json!([message]))),
+            ("message", Field::Json(json!(ndl_message_line(19011)))),
+            ("details", Field::Json(json!(details))),
         ])),
+    }
+}
+
+fn no_condition() -> Reply {
+    Reply {
+        status: 400,
+        body: body(Obj(vec![(
+            "message",
+            Field::Json(json!(ndl_message_line(19007))),
+        )])),
     }
 }
 
@@ -197,8 +215,13 @@ fn id_date(issue_id: &str) -> Option<Date> {
     .ok()
 }
 
-fn date_param(v: Option<&str>, format_code: u32, exists_code: u32) -> Result<Option<Date>, Reply> {
-    let Some(v) = v else { return Ok(None) };
+fn date_param(
+    v: Option<&str>,
+    format_code: u32,
+    exists_code: u32,
+    errs: &mut Vec<u32>,
+) -> Option<Date> {
+    let v = v?;
     let shaped = v.len() == 10
         && v.bytes().enumerate().all(|(i, b)| {
             if i == 4 || i == 7 {
@@ -208,33 +231,36 @@ fn date_param(v: Option<&str>, format_code: u32, exists_code: u32) -> Result<Opt
             }
         });
     if !shaped {
-        return Err(ndl_error(format_code));
+        errs.push(format_code);
+        return None;
     }
-    v.parse().map(Some).map_err(|_| ndl_error(exists_code))
+    v.parse().map_err(|_| errs.push(exists_code)).ok()
 }
 
-fn bounds(lo: Option<&str>, hi: Option<&str>) -> Result<Option<(i64, i64)>, Reply> {
-    let num = |v: &str| {
-        v.parse::<i64>()
-            .ok()
-            .filter(|n| *n >= 0)
-            .ok_or_else(|| ndl_error(19011))
-    };
-    Ok(match (lo.map(num).transpose()?, hi.map(num).transpose()?) {
+fn number(v: Option<&str>, errs: &mut Vec<u32>) -> Option<i64> {
+    let n = v?.parse::<i64>().ok().filter(|n| *n >= 0);
+    if n.is_none() {
+        errs.push(19011);
+    }
+    n
+}
+
+fn bounds(lo: Option<&str>, hi: Option<&str>, errs: &mut Vec<u32>) -> Option<(i64, i64)> {
+    match (number(lo, errs), number(hi, errs)) {
         (Some(a), Some(b)) => Some((a, b)),
         (Some(a), None) | (None, Some(a)) => Some((a, a)),
         (None, None) => None,
-    })
+    }
 }
 
 pub fn parse(endpoint: Endpoint, query: &str) -> Result<Query, Reply> {
     let mut params: Vec<(String, String)> = Vec::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        params.push((
-            decode(k).ok_or_else(|| ndl_error(19011))?,
-            decode(v).ok_or_else(|| ndl_error(19011))?,
-        ));
+        match (decode(k), decode(v)) {
+            (Some(k), Some(v)) => params.push((k, v)),
+            _ => return Err(ndl_errors(&[19011])),
+        }
     }
     let get = |name: &str| {
         params
@@ -244,14 +270,17 @@ pub fn parse(endpoint: Endpoint, query: &str) -> Result<Query, Reply> {
             .map(|(_, v)| v.as_str())
             .filter(|v| !v.is_empty())
     };
+    if !CONDITIONS.iter().any(|c| get(c).is_some()) {
+        return Err(no_condition());
+    }
 
+    let mut errs = Vec::new();
     let start = match get("startRecord") {
         None => 1,
-        Some(v) => v
-            .parse()
-            .ok()
-            .filter(|n| *n >= 1)
-            .ok_or_else(|| ndl_error(19004))?,
+        Some(v) => v.parse().ok().filter(|n| *n >= 1).unwrap_or_else(|| {
+            errs.push(19004);
+            1
+        }),
     };
     let (limit, limit_code) = match endpoint {
         Endpoint::Meeting => (10, 19006),
@@ -264,13 +293,16 @@ pub fn parse(endpoint: Endpoint, query: &str) -> Result<Query, Reply> {
             .parse()
             .ok()
             .filter(|n| (1..=limit).contains(n))
-            .ok_or_else(|| ndl_error(limit_code))?,
+            .unwrap_or_else(|| {
+                errs.push(limit_code);
+                1
+            }),
     };
-    let from = date_param(get("from"), 19012, 19018)?;
-    let until = date_param(get("until"), 19013, 19019)?;
+    let from = date_param(get("from"), 19012, 19018, &mut errs);
+    let until = date_param(get("until"), 19013, 19019, &mut errs);
     if let (Some(f), Some(u)) = (from, until) {
         if f > u {
-            return Err(ndl_error(19014));
+            errs.push(19014);
         }
     }
     let role = get("speakerRole").map(str::to_string);
@@ -278,27 +310,21 @@ pub fn parse(endpoint: Endpoint, query: &str) -> Result<Query, Reply> {
         .as_deref()
         .is_some_and(|r| !["証人", "参考人", "公述人"].contains(&r))
     {
-        return Err(ndl_error(19011));
+        errs.push(19011);
     }
     let issue_id = get("issueID").map(str::to_string);
-    let speech_id = get("speechID").map(str::to_string);
-    if issue_id.as_deref().is_some_and(|i| !valid_issue_id(i))
-        || speech_id.as_deref().is_some_and(|i| !valid_speech_id(i))
-    {
-        return Err(ndl_error(19011));
+    if issue_id.as_deref().is_some_and(|i| !valid_issue_id(i)) {
+        errs.push(19011);
     }
-    let speech_number = get("speechNumber")
-        .map(|v| {
-            v.parse::<i64>()
-                .ok()
-                .filter(|n| *n >= 0)
-                .ok_or_else(|| ndl_error(19011))
-        })
-        .transpose()?;
-    let session = bounds(get("sessionFrom"), get("sessionTo"))?;
-    let issue = bounds(get("issueFrom"), get("issueTo"))?;
-    if !CONDITIONS.iter().any(|c| get(c).is_some()) {
-        return Err(ndl_error(19007));
+    let speech_id = get("speechID").map(str::to_string);
+    if speech_id.as_deref().is_some_and(|i| !valid_speech_id(i)) {
+        errs.push(19011);
+    }
+    let speech_number = number(get("speechNumber"), &mut errs);
+    let session = bounds(get("sessionFrom"), get("sessionTo"), &mut errs);
+    let issue = bounds(get("issueFrom"), get("issueTo"), &mut errs);
+    if !errs.is_empty() {
+        return Err(ndl_errors(&errs));
     }
 
     let mut unsupported: Vec<String> = Vec::new();
@@ -547,7 +573,7 @@ pub fn answer(store: &Store, q: &Query, today: Date) -> anyhow::Result<Reply> {
         return Ok(zero());
     }
     if q.start > total {
-        return Ok(ndl_error(19004));
+        return Ok(ndl_errors(&[19004]));
     }
 
     let mut page_args = args.clone();
@@ -771,8 +797,14 @@ mod tests {
         assert!(v.as_object().unwrap().contains_key("nextRecordPosition"));
         assert_eq!(speech_ids(&v), ["999900003X00320261020_002"]);
 
-        let (_, v) = ask(&store, Endpoint::Speech, &format!("{q}&startRecord=4"));
-        assert!(v["message"].as_str().unwrap().starts_with("(19004)"));
+        let r = reply(
+            &store,
+            Endpoint::Speech,
+            &format!("{q}&startRecord=4"),
+            TODAY,
+        );
+        assert_eq!(r.status, 400);
+        assert_eq!(r.body, BEYOND_HITS);
     }
 
     #[test]
@@ -1022,32 +1054,39 @@ mod tests {
         assert_eq!(status, 200);
     }
 
-    fn ndl_error(ep: Endpoint, q: &str) -> Value {
+    const BEYOND_HITS: &str = "{\"message\":\"(19011)検索条件の入力に誤りがあります。\",\"details\":[\"(0) (19004)startRecordには 1から検索件数までの値を指定してください。\"]}";
+
+    fn ndl_error(ep: Endpoint, q: &str) -> Reply {
         let r = parse(ep, q).unwrap_err();
-        assert_eq!(r.status, 200);
-        assert!(r.body.starts_with("{\"message\":\"(190"), "{}", r.body);
-        let v: Value = serde_json::from_str(&r.body).unwrap();
-        assert!(v.get("mirror").is_none());
-        v
+        assert_eq!(r.status, 400);
+        assert!(!r.body.contains("\"mirror\""), "{}", r.body);
+        r
+    }
+
+    fn detail_codes(ep: Endpoint, q: &str) -> Vec<String> {
+        let v: Value = serde_json::from_str(&ndl_error(ep, q).body).unwrap();
+        assert_eq!(v["message"], "(19011)検索条件の入力に誤りがあります。");
+        v["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_str().unwrap()[4..11].to_string())
+            .collect()
     }
 
     #[test]
     fn maximum_records_over_limit_is_19005_or_19006() {
-        let v = ndl_error(Endpoint::Speech, "any=x&maximumRecords=101");
         assert_eq!(
-            v["message"],
-            "(19005)maximumRecordsには1～100の値を指定してください。"
+            ndl_error(Endpoint::Speech, "any=x&maximumRecords=101").body,
+            "{\"message\":\"(19011)検索条件の入力に誤りがあります。\",\"details\":[\"(0) (19005)maximumRecordsには1～100の値を指定してください。\"]}"
         );
         assert_eq!(
-            v["details"],
-            json!(["(19005)maximumRecordsには1～100の値を指定してください。"])
+            detail_codes(Endpoint::MeetingList, "any=x&maximumRecords=0"),
+            ["(19005)"]
         );
-        let v = ndl_error(Endpoint::MeetingList, "any=x&maximumRecords=0");
-        assert!(v["message"].as_str().unwrap().starts_with("(19005)"));
-        let v = ndl_error(Endpoint::Meeting, "any=x&maximumRecords=11");
         assert_eq!(
-            v["message"],
-            "(19006)maximumRecordsには1～10の値を指定してください。"
+            ndl_error(Endpoint::Meeting, "any=x&maximumRecords=11").body,
+            "{\"message\":\"(19011)検索条件の入力に誤りがあります。\",\"details\":[\"(0) (19006)maximumRecordsには1～10の値を指定してください。\"]}"
         );
         assert!(parse(Endpoint::Meeting, "any=x&maximumRecords=10").is_ok());
         assert!(parse(Endpoint::MeetingList, "any=x&maximumRecords=100").is_ok());
@@ -1055,33 +1094,53 @@ mod tests {
 
     #[test]
     fn from_after_until_is_19014() {
-        let v = ndl_error(Endpoint::Speech, "from=2026-10-21&until=2026-10-20");
         assert_eq!(
-            v["message"],
-            "(19014)fromはuntil以下、もしくはuntilはfrom以上の日付で入力してください。"
+            ndl_error(Endpoint::Speech, "from=2026-10-21&until=2026-10-20").body,
+            "{\"message\":\"(19011)検索条件の入力に誤りがあります。\",\"details\":[\"(0) (19014)fromはuntil以下、もしくはuntilはfrom以上の西暦年で入力してください。\"]}"
+        );
+    }
+
+    #[test]
+    fn input_errors_are_collected() {
+        assert_eq!(
+            ndl_error(
+                Endpoint::Speech,
+                "maximumRecords=200&from=2026-10-10&until=2026-10-01"
+            )
+            .body,
+            "{\"message\":\"(19011)検索条件の入力に誤りがあります。\",\"details\":[\"(0) (19005)maximumRecordsには1～100の値を指定してください。\",\"(1) (19014)fromはuntil以下、もしくはuntilはfrom以上の西暦年で入力してください。\"]}"
+        );
+    }
+
+    #[test]
+    fn no_condition_is_19007_without_details() {
+        assert_eq!(
+            ndl_error(Endpoint::Speech, "maximumRecords=5").body,
+            "{\"message\":\"(19007)検索条件を指定してください。\"}"
         );
     }
 
     #[test]
     fn other_input_errors_reuse_ndl_codes() {
-        let code = |ep, q| ndl_error(ep, q)["message"].as_str().unwrap()[..7].to_string();
-        assert_eq!(code(Endpoint::Speech, "maximumRecords=5"), "(19007)");
-        assert_eq!(code(Endpoint::Speech, "any=x&startRecord=0"), "(19004)");
-        assert_eq!(code(Endpoint::Speech, "speakerRole=委員長"), "(19011)");
+        let code = |q| detail_codes(Endpoint::Speech, q);
+        assert_eq!(code("any=x&startRecord=0"), ["(19004)"]);
         assert_eq!(
-            code(Endpoint::Speech, "issueID=100105254x00119470520"),
-            "(19011)"
+            ndl_error(Endpoint::Speech, "any=x&startRecord=0").body,
+            BEYOND_HITS
         );
+        assert_eq!(code("speakerRole=委員長"), ["(19011)"]);
+        assert_eq!(code("issueID=100105254x00119470520"), ["(19011)"]);
+        assert_eq!(code("speechID=100105254X00119470520_00"), ["(19011)"]);
+        assert_eq!(code("speechNumber=a"), ["(19011)"]);
+        assert_eq!(code("sessionFrom=x"), ["(19011)"]);
+        assert_eq!(code("from=2026/10/20"), ["(19012)"]);
+        assert_eq!(code("until=20261020"), ["(19013)"]);
+        assert_eq!(code("from=2026-02-30"), ["(19018)"]);
+        assert_eq!(code("until=2026-13-01"), ["(19019)"]);
         assert_eq!(
-            code(Endpoint::Speech, "speechID=100105254X00119470520_00"),
-            "(19011)"
+            code("from=2026-02-30&until=x&speakerRole=a"),
+            ["(19018)", "(19013)", "(19011)"]
         );
-        assert_eq!(code(Endpoint::Speech, "speechNumber=a"), "(19011)");
-        assert_eq!(code(Endpoint::Speech, "sessionFrom=x"), "(19011)");
-        assert_eq!(code(Endpoint::Speech, "from=2026/10/20"), "(19012)");
-        assert_eq!(code(Endpoint::Speech, "until=20261020"), "(19013)");
-        assert_eq!(code(Endpoint::Speech, "from=2026-02-30"), "(19018)");
-        assert_eq!(code(Endpoint::Speech, "until=2026-13-01"), "(19019)");
         assert!(parse(Endpoint::Speech, "speechID=100105254X00119470520_0001").is_ok());
     }
 
