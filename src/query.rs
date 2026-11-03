@@ -467,6 +467,8 @@ fn speech_where(q: &Query) -> Where {
 const HOUSE_RANK: &str = "CASE m.house WHEN '衆議院' THEN 0 WHEN '参議院' THEN 1 ELSE 2 END";
 
 pub fn answer(store: &Store, q: &Query, today: Date) -> anyhow::Result<Reply> {
+    // One read transaction, so coverage, the count and the page come from one snapshot.
+    let _snapshot = store.conn().unchecked_transaction()?;
     let coverage = store.coverage()?;
     let mut approximate = vec!["order"];
     if !q.any.is_empty() {
@@ -892,6 +894,39 @@ mod tests {
         assert_eq!(speech_ids(&v), ["999900009X00120261021_001"]);
         let (_, v) = ask(&store, Endpoint::Speech, &format!("{RANGE}&any=了解しま"));
         assert_eq!(speech_ids(&v), ["999900003X00320261020_002"]);
+    }
+
+    #[test]
+    fn an_answer_is_one_snapshot() {
+        let (dir, _store) = filled();
+        let path = dir.path().join("m.sqlite");
+        let writer = Store::open(&path).unwrap();
+        let mut reader = Store::open_read_only(&path).unwrap();
+        let mut n = 0;
+        reader
+            .conn_mut()
+            .progress_handler(
+                10,
+                Some(move || {
+                    n += 1;
+                    writer
+                        .conn()
+                        .execute(
+                            "INSERT INTO meetings SELECT ?1, date, session, house, name, issue_no,
+                                 version_id, NULL, last_verified FROM meetings WHERE issue_id = ?2",
+                            rusqlite::params![format!("w{n}"), M1],
+                        )
+                        .unwrap();
+                    false
+                }),
+            )
+            .unwrap();
+        let (_, v) = ask(
+            &reader,
+            Endpoint::MeetingList,
+            &format!("{RANGE}&maximumRecords=100"),
+        );
+        assert_eq!(v["numberOfRecords"], v["numberOfReturn"]);
     }
 
     #[test]

@@ -222,6 +222,11 @@ impl Store {
         &self.conn
     }
 
+    #[cfg(test)]
+    pub fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
     pub fn record_fetch(&self, url: &str, at: Timestamp, body: &[u8]) -> anyhow::Result<i64> {
         let tx = self.conn.unchecked_transaction()?;
         let sha = put_blob(&tx, body)?;
