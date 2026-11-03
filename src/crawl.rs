@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::time::Duration;
@@ -141,7 +141,7 @@ pub fn next_task(
     now: Timestamp,
     last_slot_was_backfill: bool,
 ) -> Option<Task> {
-    next_task_skipping(days, today, now, last_slot_was_backfill, None)
+    next_task_skipping(days, today, now, last_slot_was_backfill, &BTreeSet::new())
 }
 
 fn next_task_skipping(
@@ -149,29 +149,32 @@ fn next_task_skipping(
     today: Date,
     now: Timestamp,
     last_slot_was_backfill: bool,
-    skip: Option<Date>,
+    deferred: &BTreeSet<Date>,
 ) -> Option<Task> {
+    let eligible = |d: &Date| !deferred.contains(d);
+    let older = |from: Date| {
+        std::iter::successors(Some(from), |d| d.yesterday().ok())
+            .take_while(|&d| d >= crate::ndl::FLOOR)
+    };
     let Some(&(newest, _)) = days.last() else {
-        return Some(Task::Head(today)).filter(|t| Some(t.date()) != skip);
+        return older(today).find(eligible).map(Task::Head);
     };
     // Head: the newest missing day above the oldest crawled day.
     let known: BTreeSet<Date> = days.iter().map(|&(d, _)| d).collect();
     let oldest = days[0].0;
-    let mut d = today;
-    while d > oldest {
-        if !known.contains(&d) && Some(d) != skip {
-            return Some(Task::Head(d));
-        }
-        d = d.yesterday().ok()?;
+    if let Some(d) = older(today)
+        .take_while(|&d| d > oldest)
+        .find(|d| !known.contains(d) && eligible(d))
+    {
+        return Some(Task::Head(d));
     }
 
     let elapsed = |v: Timestamp| now.duration_since(v).as_secs();
     let age = |d: Date| (today - d).get_days();
-    let eligible = |d: Date| Some(d) != skip;
 
     let recent = days
         .iter()
-        .filter(|&&(d, _)| age(d) <= RECENT_DAYS && eligible(d))
+        .filter(|&&(d, _)| age(d) <= RECENT_DAYS && eligible(&d))
         .filter_map(|&(d, v)| {
             let every = if age(d) <= DAILY_DAYS { 1 } else { 7 } * DAY_SECS;
             let overdue = elapsed(v) - every;
@@ -189,15 +192,16 @@ fn next_task_skipping(
         }
         run_start = d;
     }
+    // Passing a deferred day keeps coverage contiguous: it ends at that day until it is crawled.
     let backfill = run_start
         .yesterday()
         .ok()
-        .filter(|&d| d >= crate::ndl::FLOOR && eligible(d))
+        .and_then(|start| older(start).find(|d| !known.contains(d) && eligible(d)))
         .map(Task::Backfill);
     // "Nothing due" exists only because old days are re-checked just after OLD_RECHECK_SECS.
     let recheck = days
         .iter()
-        .filter(|&&(d, v)| age(d) > RECENT_DAYS && elapsed(v) > OLD_RECHECK_SECS && eligible(d))
+        .filter(|&&(d, v)| age(d) > RECENT_DAYS && elapsed(v) > OLD_RECHECK_SECS && eligible(&d))
         .min_by_key(|&&(_, v)| v)
         .map(|&(d, _)| Task::Recheck(d));
     if last_slot_was_backfill {
@@ -207,11 +211,23 @@ fn next_task_skipping(
     }
 }
 
+const DEFER_MAX_HOURS: i64 = 7 * 24;
+
 #[derive(Debug, Default)]
 pub struct RunState {
     last_slot_was_backfill: bool,
-    deferred: Option<Task>,
-    ran_other_since_deferred: bool,
+    // date -> (failed attempts, not before)
+    deferred: BTreeMap<Date, (u32, Timestamp)>,
+}
+
+impl RunState {
+    fn defer(&mut self, date: Date, now: Timestamp) -> Timestamp {
+        let entry = self.deferred.entry(date).or_insert((0, now));
+        entry.0 += 1;
+        let hours = (1i64 << (entry.0 - 1).min(8)).min(DEFER_MAX_HOURS);
+        entry.1 = now + jiff::SignedDuration::from_hours(hours);
+        entry.1
+    }
 }
 
 pub fn jst_date(now: Timestamp) -> Date {
@@ -230,29 +246,18 @@ pub fn step(
     progress: &Progress,
 ) -> anyhow::Result<()> {
     let http = LoggedHttp::new(http, progress);
-    let retry = state.deferred.is_some() && state.ran_other_since_deferred;
-    let task = if retry {
-        state.ran_other_since_deferred = false;
-        state.deferred.take()
-    } else {
-        let days = store.days()?;
-        let skip = state.deferred.map(|t| t.date());
-        let next = next_task_skipping(&days, today, clock(), state.last_slot_was_backfill, skip);
-        if next.is_some() {
-            state.ran_other_since_deferred = true;
-            next
-        } else if state.deferred.is_some() {
-            progress.sleeping(IDLE, "only a deferred day is left");
-            sleep(IDLE);
-            state.ran_other_since_deferred = false;
-            state.deferred.take()
-        } else {
-            progress.sleeping(IDLE, "nothing due");
-            sleep(IDLE);
-            return Ok(());
-        }
-    };
-    let Some(task) = task else {
+    let now = clock();
+    let deferred: BTreeSet<Date> = state
+        .deferred
+        .iter()
+        .filter(|&(_, &(_, not_before))| not_before > now)
+        .map(|(&d, _)| d)
+        .collect();
+    let days = store.days()?;
+    let Some(task) = next_task_skipping(&days, today, now, state.last_slot_was_backfill, &deferred)
+    else {
+        progress.sleeping(IDLE, "nothing due");
+        sleep(IDLE);
         return Ok(());
     };
     match task {
@@ -262,13 +267,16 @@ pub fn step(
     }
     let (wait, why) = match crawl_day(&http, store, task.date(), clock) {
         Ok(DayOutcome::Applied(report)) => {
+            state.deferred.remove(&task.date());
             progress.applied(&task, &report);
             return Ok(());
         }
         Ok(DayOutcome::Inconsistent(why)) => {
-            progress.failed(&task, &format!("inconsistent, will retry: {why}"));
-            state.deferred = Some(task);
-            state.ran_other_since_deferred = false;
+            let until = state.defer(task.date(), clock());
+            progress.failed(
+                &task,
+                &format!("inconsistent, will retry after {until}: {why}"),
+            );
             return Ok(());
         }
         Err(CrawlError::Store(e)) => return Err(e),
@@ -277,9 +285,8 @@ pub fn step(
             (BUSY, "backing off")
         }
         Err(e) => {
-            progress.failed(&task, &e.to_string());
-            state.deferred = Some(task);
-            state.ran_other_since_deferred = false;
+            let until = state.defer(task.date(), clock());
+            progress.failed(&task, &format!("{e}; will retry after {until}"));
             match e {
                 CrawlError::Http(HttpError::RetryAfter { wait, .. }) => {
                     (wait.max(FAILED), "Retry-After")
@@ -514,7 +521,7 @@ mod scheduler_tests {
     use super::*;
     use crate::ndl::FLOOR;
     use jiff::civil::date;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -684,6 +691,7 @@ mod scheduler_tests {
         store: Store,
         state: RunState,
         today: Date,
+        clock: Cell<Timestamp>,
         slept: RefCell<Vec<Duration>>,
         text: Arc<Mutex<Vec<u8>>>,
         progress: Progress,
@@ -711,6 +719,7 @@ mod scheduler_tests {
                 store,
                 state: RunState::default(),
                 today: today(),
+                clock: Cell::new(now()),
                 slept: RefCell::new(vec![]),
                 progress: Progress::new(Box::new(Sink(text.clone()))),
                 text,
@@ -724,7 +733,7 @@ mod scheduler_tests {
                 &self.store,
                 &mut self.state,
                 self.today,
-                &now,
+                &|| self.clock.get(),
                 &|d| slept.borrow_mut().push(d),
                 &self.progress,
             )
@@ -811,68 +820,113 @@ mod scheduler_tests {
         assert!(h.output().contains("head 2026-11-03"), "{}", h.output());
     }
 
-    #[test]
-    fn inconsistent_day_is_retried_after_the_next_task() {
+    fn shifting_day(target: Date) -> HashMap<String, Vec<u8>> {
         let fixture = |n: &str| std::fs::read(format!("tests/fixtures/{n}")).unwrap();
         let shifted = String::from_utf8(fixture("meeting_day_p2.json"))
             .unwrap()
             .replace("\"numberOfRecords\": 3", "\"numberOfRecords\": 4");
-        let target = date(2026, 10, 20);
-        let old = date(2026, 3, 1);
         let mut pages = HashMap::new();
         pages.insert(day_url(target, 1), fixture("meeting_day_p1.json"));
         pages.insert(day_url(target, 3), shifted.into_bytes());
-        pages.insert(day_url(old, 1), br#"{"numberOfRecords":0}"#.to_vec());
-        let http = Fake {
-            pages,
-            log: Mutex::new(vec![]),
-        };
-        let mut h = Harness::new();
-        let stale = now() - jiff::SignedDuration::from_hours(24 * 40);
-        h.fill(old, date(2026, 10, 21), &[target], old, stale);
-        h.today = date(2026, 10, 21);
-        for _ in 0..3 {
-            h.step(&http);
-        }
-        let starts = |d: Date| day_url(d, 1);
-        let log = http.log.lock().unwrap().clone();
-        let firsts: Vec<_> = log
+        pages
+    }
+
+    fn fetched(http: &Fake, d: Date) -> usize {
+        let url = day_url(d, 1);
+        http.log
+            .lock()
+            .unwrap()
             .iter()
-            .filter(|u| **u == starts(target) || **u == starts(old))
-            .map(|u| if *u == starts(old) { "old" } else { "target" })
-            .collect();
-        assert_eq!(firsts, ["target", "old", "target"], "{log:?}");
-        assert!(h.output().contains("will retry"), "{}", h.output());
+            .filter(|u| **u == url)
+            .count()
     }
 
     #[test]
-    fn lone_inconsistent_day_waits_a_minute_before_its_retry() {
-        let fixture = |n: &str| std::fs::read(format!("tests/fixtures/{n}")).unwrap();
-        let shifted = String::from_utf8(fixture("meeting_day_p2.json"))
-            .unwrap()
-            .replace("\"numberOfRecords\": 3", "\"numberOfRecords\": 4");
-        let target = date(2026, 10, 20);
-        let mut pages = HashMap::new();
-        pages.insert(day_url(target, 1), fixture("meeting_day_p1.json"));
-        pages.insert(day_url(target, 3), shifted.into_bytes());
+    fn inconsistent_day_waits_for_its_next_attempt() {
+        let target = FLOOR;
         let http = Fake {
-            pages,
+            pages: shifting_day(target),
             log: Mutex::new(vec![]),
         };
         let mut h = Harness::new();
         h.today = target;
         h.step(&http);
         assert!(h.slept.borrow().is_empty());
+        let retry = now() + jiff::SignedDuration::from_hours(1);
+        assert!(
+            h.output().contains(&format!("will retry after {retry}")),
+            "{}",
+            h.output()
+        );
         h.step(&http);
         assert_eq!(*h.slept.borrow(), [Duration::from_secs(60)]);
-        let starts = http
-            .log
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|u| **u == day_url(target, 1))
-            .count();
-        assert_eq!(starts, 2);
+        assert_eq!(fetched(&http, target), 1);
+        h.clock.set(retry);
+        h.step(&http);
+        assert_eq!(fetched(&http, target), 2);
+    }
+
+    #[test]
+    fn two_failing_days_do_not_stop_a_due_day_nor_the_backfill() {
+        let mut h = Harness::new();
+        let first = date(2026, 6, 1);
+        let yesterday = today().yesterday().unwrap();
+        let stale_day = date(2026, 10, 20);
+        let stale = now() - jiff::SignedDuration::from_hours(48);
+        h.fill(first, yesterday.yesterday().unwrap(), &[], stale_day, stale);
+        let backfill = first.yesterday().unwrap();
+        let http = fake(vec![
+            (stale_day, r#"{"numberOfRecords":0}"#),
+            (backfill, r#"{"numberOfRecords":0}"#),
+        ]);
+        for _ in 0..4 {
+            h.step(&http);
+        }
+        assert_eq!(
+            *http.log.lock().unwrap(),
+            [
+                day_url(today(), 1),
+                day_url(yesterday, 1),
+                day_url(stale_day, 1),
+                day_url(backfill, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn backfill_passes_a_failing_day() {
+        let mut h = Harness::new();
+        let first = date(2026, 10, 1);
+        h.fill(first, today(), &[], first, now());
+        let bad = first.yesterday().unwrap();
+        let older = bad.yesterday().unwrap();
+        let oldest = older.yesterday().unwrap();
+        let http = fake(vec![
+            (older, r#"{"numberOfRecords":0}"#),
+            (oldest, r#"{"numberOfRecords":0}"#),
+        ]);
+        for _ in 0..3 {
+            h.step(&http);
+        }
+        assert_eq!(
+            *http.log.lock().unwrap(),
+            [day_url(bad, 1), day_url(older, 1), day_url(oldest, 1)]
+        );
+        assert_eq!(h.store.coverage().unwrap(), Some((first, today())));
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_a_week() {
+        let mut h = Harness::new();
+        let http = fake(vec![]);
+        let mut hours = vec![];
+        for _ in 0..10 {
+            h.step(&http);
+            let (_, not_before) = h.state.deferred[&today()];
+            hours.push(not_before.duration_since(h.clock.get()).as_hours());
+            h.clock.set(not_before);
+        }
+        assert_eq!(hours, [1, 2, 4, 8, 16, 32, 64, 128, 168, 168]);
     }
 
     #[test]
