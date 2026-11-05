@@ -69,10 +69,10 @@
   - `pub trait Http: Sync { fn get(&self, url: &str) -> Result<Vec<u8>, HttpError>; }`, `pub enum HttpError { NotFound(String), GaveUp(String) }`.
   - `pub struct Client`; `Client::new(user_agent: String) -> Client`.
   - `pub fn user_agent(operator: &str) -> anyhow::Result<String>`: errors unless `operator.trim()` is non-empty and contains `@` or `http`; returns `"kokkai-mirror/<version> (+https://github.com/Kohei-Wada/kokkai-mirror) <operator>"`.
-  - `pub const NDL_SPACING: f64 = 3.0;`
+  - `pub const NDL_SPACING: f64 = 10.0;`
 - Port kokkai-cli `src/http.rs` and its tests unchanged in behaviour (attempts 5, backoff 2 s doubling, Retry-After cap 300 s, NDL spacing counted from the end of the previous response), with the User-Agent passed in instead of a constant. Drop the 1 s non-NDL spacing: every request goes to the NDL, so `spacing()` is `NDL_SPACING`.
 
-- [ ] Port the tests: `ndl_waits_three_seconds_after_the_previous_response_ends`, `ndl_counts_a_failed_response_as_received`, `retry_after_is_honoured`, `retry_after_over_cap_gives_up`, `invalid_retry_after_falls_back_to_backoff`, `not_found_is_not_retried`, `other_client_errors_are_not_retried`, `timeouts_throttling_and_server_errors_are_retried`, `gives_up_after_five_attempts_naming_the_url`, `sends_the_user_agent`. Add `user_agent_requires_a_contact` (`""`, `"me"` fail; `"me@example.org"`, `"https://example.org/contact"` pass; result starts with `kokkai-mirror/`).
+- [ ] Port the tests: `ndl_waits_ten_seconds_after_the_previous_response_ends`, `ndl_counts_a_failed_response_as_received`, `retry_after_is_honoured`, `retry_after_over_cap_gives_up`, `invalid_retry_after_falls_back_to_backoff`, `not_found_is_not_retried`, `other_client_errors_are_not_retried`, `timeouts_throttling_and_server_errors_are_retried`, `gives_up_after_five_attempts_naming_the_url`, `sends_the_user_agent`. Add `user_agent_requires_a_contact` (`""`, `"me"` fail; `"me@example.org"`, `"https://example.org/contact"` pass; result starts with `kokkai-mirror/`).
 - [ ] Run `cargo test http`; expect failures, implement, rerun; expect all pass. `cargo clippy --all-targets -- -D warnings` clean.
 - [ ] Commit `feat: add the paced NDL client`.
 
