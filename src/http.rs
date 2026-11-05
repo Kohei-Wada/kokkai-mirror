@@ -7,7 +7,7 @@ use jiff::Timestamp;
 const ATTEMPTS: u32 = 5;
 const BACKOFF: f64 = 2.0;
 const RETRY_AFTER_CAP: f64 = 300.0;
-pub const NDL_SPACING: f64 = 3.0;
+pub const NDL_SPACING: f64 = 10.0;
 
 #[derive(Debug)]
 pub enum HttpError {
@@ -217,13 +217,13 @@ mod tests {
     }
 
     #[test]
-    fn ndl_waits_three_seconds_after_the_previous_response_ends() {
-        let (c, _, sleeps) = client(vec![Ok(vec![]), Ok(vec![])], vec![0.0, 5.0, 6.0, 9.0]);
+    fn ndl_waits_ten_seconds_after_the_previous_response_ends() {
+        let (c, _, sleeps) = client(vec![Ok(vec![]), Ok(vec![])], vec![0.0, 5.0, 6.0, 16.0]);
         c.get("https://kokkai.ndl.go.jp/api/speech?a=1").unwrap();
         c.get("https://kokkai.ndl.go.jp/api/speech?a=2").unwrap();
         let s = sleeps.lock().unwrap();
         assert_eq!(s.len(), 1);
-        assert!((s[0] - 2.0).abs() < 1e-9, "{s:?}");
+        assert!((s[0] - 9.0).abs() < 1e-9, "{s:?}");
     }
 
     #[test]
@@ -234,7 +234,7 @@ mod tests {
         );
         assert_eq!(c.get("https://kokkai.ndl.go.jp/api/speech").unwrap(), b"ok");
         assert_eq!(seen.lock().unwrap().len(), 2);
-        assert_eq!(*sleeps.lock().unwrap(), [2.0, 1.0]);
+        assert_eq!(*sleeps.lock().unwrap(), [2.0, 8.0]);
     }
 
     #[test]

@@ -8,7 +8,7 @@ like kokkai-cli). Status: design.
 kokkai-cli (`Kohei-Wada/kokkai-cli`) reads the NDL 国会会議録検索システム API. The NDL asks
 clients to avoid concurrent requests and to wait "数秒程度" after each response before the next
 (https://kokkai.ndl.go.jp/api.html), and may block heavy users without notice. So every analysis
-that needs many speeches is slow (高市早苗's speeches alone are ~93 requests ≈ 8 minutes at 3 s), and
+that needs many speeches is slow (高市早苗's speeches alone are ~93 requests ≈ 16 minutes at 10 s), and
 anything that compares many members is out of reach. There is no bulk download (NDL Lab lists the
 会議録 text dataset as not provided).
 
@@ -73,7 +73,7 @@ It is an experiment and a toy for exploring the Diet's record. The software is w
 
 ## Constraints
 
-- **NDL pace:** one request at a time; wait 3 s after each response is fully received; honour 429/5xx
+- **NDL pace:** one request at a time; wait 10 s after each response is fully received; honour 429/5xx
   with backoff and Retry-After. Max 100 records per `speech`/`meeting_list` request, 10 per `meeting`.
   A descriptive User-Agent with a reachable contact (the operator's choice; the mirror must make the
   self-hoster set one).
