@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- "one request at a time; wait 3 s after each response is fully received; honour 429/5xx with backoff and Retry-After." Not configurable; no flag, env var or code path makes it faster.
+- "one request at a time; wait 10 s after each response is fully received; honour 429/5xx with backoff and Retry-After." Not configurable; no flag, env var or code path makes it faster.
 - "Max 100 records per `speech`/`meeting_list` request, 10 per `meeting`."
 - "A descriptive User-Agent with a reachable contact (the operator's choice; the mirror must make the self-hoster set one)."
 - "Every fetched response is kept with its fetch time and content hash." A changed record is never overwritten.
@@ -69,10 +69,10 @@
   - `pub trait Http: Sync { fn get(&self, url: &str) -> Result<Vec<u8>, HttpError>; }`, `pub enum HttpError { NotFound(String), GaveUp(String) }`.
   - `pub struct Client`; `Client::new(user_agent: String) -> Client`.
   - `pub fn user_agent(operator: &str) -> anyhow::Result<String>`: errors unless `operator.trim()` is non-empty and contains `@` or `http`; returns `"kokkai-mirror/<version> (+https://github.com/Kohei-Wada/kokkai-mirror) <operator>"`.
-  - `pub const NDL_SPACING: f64 = 3.0;`
+  - `pub const NDL_SPACING: f64 = 10.0;`
 - Port kokkai-cli `src/http.rs` and its tests unchanged in behaviour (attempts 5, backoff 2 s doubling, Retry-After cap 300 s, NDL spacing counted from the end of the previous response), with the User-Agent passed in instead of a constant. Drop the 1 s non-NDL spacing: every request goes to the NDL, so `spacing()` is `NDL_SPACING`.
 
-- [ ] Port the tests: `ndl_waits_three_seconds_after_the_previous_response_ends`, `ndl_counts_a_failed_response_as_received`, `retry_after_is_honoured`, `retry_after_over_cap_gives_up`, `invalid_retry_after_falls_back_to_backoff`, `not_found_is_not_retried`, `other_client_errors_are_not_retried`, `timeouts_throttling_and_server_errors_are_retried`, `gives_up_after_five_attempts_naming_the_url`, `sends_the_user_agent`. Add `user_agent_requires_a_contact` (`""`, `"me"` fail; `"me@example.org"`, `"https://example.org/contact"` pass; result starts with `kokkai-mirror/`).
+- [ ] Port the tests: `ndl_waits_ten_seconds_after_the_previous_response_ends`, `ndl_counts_a_failed_response_as_received`, `retry_after_is_honoured`, `retry_after_over_cap_gives_up`, `invalid_retry_after_falls_back_to_backoff`, `not_found_is_not_retried`, `other_client_errors_are_not_retried`, `timeouts_throttling_and_server_errors_are_retried`, `gives_up_after_five_attempts_naming_the_url`, `sends_the_user_agent`. Add `user_agent_requires_a_contact` (`""`, `"me"` fail; `"me@example.org"`, `"https://example.org/contact"` pass; result starts with `kokkai-mirror/`).
 - [ ] Run `cargo test http`; expect failures, implement, rerun; expect all pass. `cargo clippy --all-targets -- -D warnings` clean.
 - [ ] Commit `feat: add the paced NDL client`.
 
@@ -151,7 +151,7 @@
 - Today is the JST date (fixed +9 offset, as kokkai-cli `ndl::today`).
 
 - [ ] Tests: `head_days_come_first_newest_first`, `recent_days_are_rechecked_daily_then_weekly` (age 10 verified 2 days ago is due; age 60 verified 3 days ago is not), `backfill_and_old_recheck_alternate`, `backfill_stops_at_the_floor`, `nothing_due_is_none`, `busy_body_backs_off` (fake sleep sees 300), `second_crawler_is_refused` (temp db, two locks).
-- [ ] Run `cargo test`, implement, rerun. Manual check against the NDL (the only live step in this plan): `cargo run -- crawl --db /tmp/m.sqlite --user-agent <contact>` for ~1 minute; stderr shows requests ≥3 s apart (response end to next start) and today's head days; stop with Ctrl-C and restart: it resumes without refetching applied days.
+- [ ] Run `cargo test`, implement, rerun. Manual check against the NDL (the only live step in this plan): `cargo run -- crawl --db /tmp/m.sqlite --user-agent <contact>` for ~1 minute; stderr shows requests ≥10 s apart (response end to next start) and today's head days; stop with Ctrl-C and restart: it resumes without refetching applied days.
 - [ ] Commit `feat: schedule head, backfill and re-verification in one paced loop`.
 
 ### Task 6: Query engine
@@ -192,7 +192,7 @@
 **Files:**
 - Create: `README.md`, `LICENSE` (MIT, as kokkai-cli)
 
-- [ ] Write: what it is; build and run (`crawl`, `serve`, flags); the pace and that it cannot be lowered; the NDL terms (https://kokkai.ndl.go.jp/api.html) and the ask to send the NDL an inquiry stating purpose, pace and duration before a full crawl; copyright: speech text belongs to the speakers, the mirror is for the operator's own use and analysis, do not republish the text; coverage errors; what is approximate (order, `any`, `searchObject` in speech records follows the observed rule) and the unsupported parameters; the `mirror` note; mirror-only endpoints; storage size (~7.8 GB of text plus versions) and timing (head within hours; the full backfill on the order of days).
+- [ ] Write: what it is; build and run (`crawl`, `serve`, flags); the pace and that it cannot be lowered; the NDL terms (https://kokkai.ndl.go.jp/api.html) and the ask to send the NDL an inquiry stating purpose, pace and duration before a full crawl; copyright: speech text belongs to the speakers, the mirror is for the operator's own use and analysis, do not republish the text; coverage errors; what is approximate (order, `any`, `searchObject` in speech records follows the observed rule) and the unsupported parameters; the `mirror` note; mirror-only endpoints; storage size (~7.8 GB of text plus versions) and timing (head within hours; the full backfill on the order of a week).
 - [ ] Check every flag and endpoint in the README against `--help` and `serve.rs`. Commit `docs: add the README`.
 
 ---

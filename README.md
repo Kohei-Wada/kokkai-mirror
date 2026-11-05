@@ -22,7 +22,7 @@ kokkai-mirror serve --db <DB> [--listen <ADDR>]
 
 ## Pace
 
-The crawler waits 3 seconds before its first request and 3 seconds after each response is fully received, and retries network errors, 408, 429 and 5xx with backoff (five attempts per request, then a 10-minute pause). A `Retry-After` on 429 or 503 is honoured at any length, as seconds or as an HTTP date. There is no flag, environment variable or code path that makes it faster.
+The crawler sends one request at a time and waits 10 seconds before its first request and 10 seconds after each response is fully received, the pace the NDL stated on 2026-11-05 (10-second spacing, i.e. 60 requests per 10 minutes, and no parallel requests). It retries network errors, 408, 429 and 5xx with backoff (five attempts per request, then a 10-minute pause). A `Retry-After` on 429 or 503 is honoured at any length, as seconds or as an HTTP date. There is no flag, environment variable or code path that makes it faster.
 
 Order of work:
 
@@ -32,7 +32,7 @@ Order of work:
 
 A day that fails (an HTTP failure, an NDL error other than "busy", or an answer that is inconsistent across its pages) is put aside and retried after 1 hour, then 2, 4, ... up to 7 days, while the other work goes on; the backfill passes it, and coverage ends at it until it is crawled. This schedule is kept in memory and starts over when the crawler restarts.
 
-The crawl unit is one meeting day (`/api/meeting` with `maximumRecords=10`), about one request per day of the calendar plus one per 10 meetings. The recent weeks are there within minutes; the full backfill takes on the order of days. The NDL Lab puts the text of everything at about 7.8 GB; the database file is larger, since it also holds every raw response page, every kept version and the full-text index.
+The crawl unit is one meeting day (`/api/meeting` with `maximumRecords=10`), about one request per day of the calendar plus one per 10 meetings. The recent weeks are there within minutes; the full backfill takes on the order of a week. The NDL Lab puts the text of everything at about 7.8 GB; the database file is larger, since it also holds every raw response page, every kept version and the full-text index.
 
 Only response bodies the NDL returned with a success status are stored (including NDL error messages sent that way). HTTP error responses (4xx/5xx) are not stored.
 
