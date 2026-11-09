@@ -402,6 +402,18 @@ impl Where {
         );
     }
 
+    /// Substring match on the speaker like `any_of`, but scanning only the speaker index.
+    fn speaker_any_of(&mut self, terms: &[String]) {
+        if terms.is_empty() {
+            return;
+        }
+        let ors = vec!["instr(speaker, ?) > 0"; terms.len()].join(" OR ");
+        self.push(
+            format!("s.speaker IN (SELECT speaker FROM speeches INDEXED BY speeches_speaker WHERE {ors})"),
+            terms.iter().map(|t| Sql::Text(t.clone())),
+        );
+    }
+
     fn text(&self) -> String {
         self.sql.join(" AND ")
     }
@@ -436,7 +448,7 @@ fn meeting_where(q: &Query, lo: Date, hi: Date) -> Where {
 
 fn speech_where(q: &Query) -> Where {
     let mut w = Where::default();
-    w.any_of("s.speaker", &q.speakers);
+    w.speaker_any_of(&q.speakers);
     for (col, v) in [("s.position", &q.position), ("s.grp", &q.group)] {
         if let Some(v) = v {
             w.push(format!("instr({col}, ?) > 0"), [Sql::Text(v.clone())]);
@@ -1058,6 +1070,35 @@ mod tests {
         assert_eq!(n("issueFrom=2&issueTo=3"), 6);
         assert_eq!(n("issueTo=1"), 6);
         assert_eq!(n("speakerRole=証人"), 0);
+    }
+
+    #[test]
+    fn speaker_search_reads_the_speaker_index_not_the_speeches() {
+        let (_dir, store) = filled();
+        let q = parse(Endpoint::Speech, &format!("speaker=見本%20会議録&{RANGE}")).unwrap();
+        let (m, s) = (meeting_where(&q, DAY, NEXT), speech_where(&q));
+        let mut args = m.args;
+        args.extend(s.args);
+        let mut cond = m.sql;
+        cond.extend(s.sql);
+        let sql = format!(
+            "EXPLAIN QUERY PLAN SELECT count(*) FROM speeches s JOIN meetings m ON m.issue_id = s.issue_id WHERE {}",
+            cond.join(" AND ")
+        );
+        let plan: Vec<String> = store
+            .conn()
+            .prepare(&sql)
+            .unwrap()
+            .query_map(rusqlite::params_from_iter(&args), |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let plan = plan.join("\n");
+        assert!(plan.contains("speeches_speaker"), "{plan}");
+        assert!(
+            !plan.contains("SCAN s\n") && !plan.ends_with("SCAN s"),
+            "{plan}"
+        );
     }
 
     #[test]

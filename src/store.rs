@@ -77,6 +77,7 @@ CREATE TABLE speeches(
     id INTEGER PRIMARY KEY, speech_id TEXT UNIQUE NOT NULL, issue_id TEXT,
     speech_order INTEGER, speaker TEXT, yomi TEXT, grp TEXT, position TEXT, role TEXT, text TEXT);
 CREATE INDEX speeches_issue ON speeches(issue_id, speech_order);
+CREATE INDEX speeches_speaker ON speeches(speaker);
 CREATE VIRTUAL TABLE speech_fts USING fts5(
     text, content='speeches', content_rowid='id', tokenize='trigram');
 CREATE TRIGGER speeches_ai AFTER INSERT ON speeches BEGIN
@@ -94,7 +95,13 @@ CREATE TABLE changes(
     to_version INTEGER, detected_at TEXT, speech_ids TEXT);
 CREATE INDEX changes_issue ON changes(issue_id);
 CREATE TABLE days(date TEXT PRIMARY KEY, first_fetched TEXT, last_verified TEXT, meetings INTEGER);
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
+";
+
+// Version 1 had no speaker index, so every speaker= query read every speech's text.
+const TO_VERSION_2: &str = "
+CREATE INDEX speeches_speaker ON speeches(speaker);
+PRAGMA user_version = 2;
 ";
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -196,7 +203,8 @@ impl Store {
         anyhow::ensure!(mode.eq_ignore_ascii_case("wal"), "WAL mode refused: {mode}");
         match conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? {
             0 => conn.execute_batch(&format!("BEGIN; {SCHEMA} COMMIT;"))?,
-            1 => {}
+            1 => conn.execute_batch(&format!("BEGIN; {TO_VERSION_2} COMMIT;"))?,
+            2 => {}
             v => anyhow::bail!("{}: unknown schema version {v}", path.display()),
         }
         Ok(Store { conn })
@@ -211,7 +219,12 @@ impl Store {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         anyhow::ensure!(
-            version == 1,
+            version != 1,
+            "{}: schema version 1; run kokkai-mirror crawl once to upgrade it",
+            path.display()
+        );
+        anyhow::ensure!(
+            version == 2,
             "{}: not a kokkai-mirror database (schema version {version})",
             path.display()
         );
@@ -943,6 +956,36 @@ mod tests {
         ] {
             assert_eq!(issue_no(issue), no, "{issue}");
         }
+    }
+
+    #[test]
+    fn open_adds_the_speaker_index_to_a_version_1_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.sqlite");
+        let store = Store::open(&path).unwrap();
+        store
+            .conn()
+            .execute_batch("DROP INDEX speeches_speaker; PRAGMA user_version = 1;")
+            .unwrap();
+        drop(store);
+        let err = Store::open_read_only(&path).err().unwrap().to_string();
+        assert!(err.contains("crawl"), "{err}");
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let indexes: i64 = store
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'speeches_speaker'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 1);
+        assert!(Store::open_read_only(&path).is_ok());
     }
 
     #[test]

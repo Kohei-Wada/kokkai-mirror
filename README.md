@@ -19,6 +19,7 @@ kokkai-mirror serve --db <DB> [--listen <ADDR>]
 
 - `crawl` runs forever, one request at a time, and is the only writer. `--user-agent` is required and must contain an email address or a URL where the NDL can reach you; the request header is `kokkai-mirror/<version> (+https://github.com/Kohei-Wada/kokkai-mirror) <your contact>`. Only one crawler can run per database (a file lock); a second one refuses to start.
 - `serve` is read-only and can run while `crawl` writes. `--listen` defaults to `127.0.0.1:8080`.
+- A database made by an older version is upgraded when `crawl` opens it; `serve` refuses it until then. Upgrading to schema version 2 adds an index on the speaker, which took 7 s on a full mirror (43 GB, page cache warm).
 
 ## Pace
 
